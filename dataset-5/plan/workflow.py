@@ -662,3 +662,500 @@ if 2025 in available_years and 2026 in available_years:
     most_decline   = growth_df.iloc[-1]
     print(f'\nระบบที่เติบโตเร็วที่สุด:  {fastest_growth["mode"]} ({fastest_growth["yoy_growth_pct"]:+.1f}%)')
     print(f'ระบบที่หดตัวมากที่สุด:    {most_decline["mode"]} ({most_decline["yoy_growth_pct"]:+.1f}%)')
+
+# %% [markdown]
+# ---
+# ## Phase 5 — เปรียบเทียบระบบรถไฟฟ้าในเมือง (Urban Rail Comparison)
+#
+# เปรียบเทียบพฤติกรรมผู้โดยสารระหว่างสายรถไฟฟ้าแต่ละสาย
+# สายที่วิเคราะห์: BTS, MRT Blue, MRT Purple, MRT Yellow, MRT Pink, Airport Rail Link, SRT Red
+#
+# **การวิเคราะห์ใน Phase นี้:**
+# 1.  Time Series — ผู้โดยสารรายวันแต่ละสาย
+# 2.  Normalized Index — เปรียบเทียบการเติบโตบน Scale เดียวกัน
+# 3.  Average Ridership Ranking — จัดอันดับค่าเฉลี่ย
+# 4.  Volatility CV — ความผันผวนสัมพัทธ์
+# 5.  Rolling 30-Day Std — ความผันผวนตามเวลา (ไม่รวมวันที่ไม่มีบริการ)
+# 6.  Weekday Seasonality — รูปแบบรายวัน (Raw + Normalized)
+# 7.  Rolling 30-Day YoY Growth — แนวโน้มการเติบโต
+# 8.  Clustered Correlation Heatmap (Log-transform) — ความสัมพันธ์ระหว่างสาย
+# 9.  Correlation Pairs Ranking — Top คู่สายที่สัมพันธ์สูงสุด
+# 10. Lag Correlation — พฤติกรรมการเปลี่ยนสาย
+# 11. Ridership Market Share Over Time (Smoothed) — สัดส่วนตลาด
+# 12. Ridership Distribution Box Plot
+# 13. Calendar Heatmap (aggfunc=median)
+# 14. Top 10 Ridership Days — วันผู้โดยสารสูงสุด
+# 15. Summary — สรุปข้อค้นพบเชิงปริมาณ
+
+# %% [markdown]
+# ### 5.1 กราฟ Time Series — ผู้โดยสารรายวันแยกตามสาย (Multi-line Chart)
+
+# %%
+# แปลงเป็น long format สำหรับ multi-line time series
+ts_long = (
+    pivot_df[rail_lines]
+    .reset_index()
+    .melt(id_vars='date', var_name='สาย', value_name='ผู้โดยสาร')
+)
+
+fig = px.line(
+    ts_long,
+    x='date',
+    y='ผู้โดยสาร',
+    color='สาย',
+    title='ปริมาณผู้โดยสารรายวันแยกตามสายรถไฟฟ้า (Daily Ridership by Rail Line)',
+    labels={'date': 'วันที่', 'ผู้โดยสาร': 'ผู้โดยสาร (คน)', 'สาย': 'สายรถไฟฟ้า'},
+)
+fig.update_layout(hovermode='x unified')
+fig.show()
+
+# %% [markdown]
+# ### 5.2 Normalized Ridership Index — เปรียบเทียบการเติบโตบน Scale เดียวกัน
+#
+# BTS ~800K/วัน vs ARL ~70K/วัน → เปรียบตรงๆ ไม่ได้
+# แปลงเป็น Index (Base = 100) ณ จุดเริ่มต้น เพื่อดู Growth Dynamics ของแต่ละสาย
+
+# %%
+# ใช้ค่าเฉลี่ย 7 วันแรกที่ > 0 เป็นฐาน — ลด noise จากวันแรกที่อาจมีข้อมูลไม่ครบ
+normalized_df = pivot_df[rail_lines].copy().astype(float)
+for col in rail_lines:
+    first_vals = normalized_df[col][normalized_df[col] > 0].head(7)
+    base = first_vals.mean() if len(first_vals) > 0 else 1.0
+    normalized_df[col] = normalized_df[col] / base * 100
+
+fig = px.line(
+    normalized_df.reset_index().melt(id_vars='date', var_name='สาย', value_name='ดัชนี'),
+    x='date',
+    y='ดัชนี',
+    color='สาย',
+    title='ดัชนีผู้โดยสาร (Ridership Index) — ฐาน = 100 ณ จุดเริ่มต้น',
+    labels={'date': 'วันที่', 'ดัชนี': 'Index (Base = 100)', 'สาย': 'สายรถไฟฟ้า'},
+)
+fig.add_hline(y=100, line_dash='dash', line_color='gray')
+# Annotation ชี้ Base Period ให้กรรมการเห็น
+fig.add_annotation(
+    x=normalized_df.index[6],
+    y=100,
+    text='Base Period (avg first 7 days)',
+    showarrow=True,
+    arrowhead=2,
+    font=dict(size=11),
+    bgcolor='lightyellow',
+)
+fig.update_layout(hovermode='x unified')
+fig.show()
+
+# %% [markdown]
+# ### 5.3 จัดอันดับค่าเฉลี่ยผู้โดยสาร (Average Ridership Ranking)
+
+# %%
+# คำนวณค่าเฉลี่ย+std โดยแทน 0 ด้วย NaN (วันที่ไม่มีบริการไม่ควรลดค่าเฉลี่ย)
+avg_s = pivot_df[rail_lines].replace(0, np.nan).mean()
+std_s = pivot_df[rail_lines].replace(0, np.nan).std()
+
+# ใช้ .fillna(0).astype(int) ป้องกัน NaN crash เมื่อแปลงเป็น int
+rank_df = pd.DataFrame({
+    'สาย':       avg_s.index,
+    'avg_daily': avg_s.fillna(0).round().astype(int).values,
+    'std_daily': std_s.fillna(0).round().astype(int).values,
+})
+rank_df['cv_pct'] = np.where(
+    rank_df['avg_daily'] > 0,
+    (rank_df['std_daily'] / rank_df['avg_daily'] * 100).round(1),
+    0.0,
+)
+rank_df = rank_df.sort_values('avg_daily', ascending=False).reset_index(drop=True)
+
+print('=== จัดอันดับค่าเฉลี่ยผู้โดยสารรายวัน ===')
+print(rank_df.to_string(index=False))
+
+fig = px.bar(
+    rank_df,
+    x='สาย',
+    y='avg_daily',
+    color='avg_daily',
+    color_continuous_scale='Blues',
+    title='ค่าเฉลี่ยผู้โดยสารรายวันแยกตามสาย (Avg Daily Ridership Ranking)',
+    labels={'avg_daily': 'เฉลี่ยผู้โดยสาร/วัน', 'สาย': 'สายรถไฟฟ้า'},
+    text='avg_daily',
+)
+fig.update_traces(texttemplate='%{text:,}', textposition='outside')
+fig.show()
+
+# %% [markdown]
+# ### 5.4 ความผันผวน — Coefficient of Variation (CV)
+#
+# CV = std / mean × 100% — เปรียบเทียบความผันผวนข้ามสายที่มี scale ต่างกันอย่างยุติธรรม
+# - CV สูง → อ่อนไหวต่อเทศกาล/เหตุการณ์พิเศษ
+# - CV ต่ำ → ฐานผู้โดยสารประจำมั่นคง
+
+# %%
+fig = px.bar(
+    rank_df.sort_values('cv_pct', ascending=False),
+    x='สาย',
+    y='cv_pct',
+    color='cv_pct',
+    color_continuous_scale='RdYlGn_r',
+    title='ความผันผวนของผู้โดยสารแต่ละสาย (Coefficient of Variation %)',
+    labels={'cv_pct': 'CV (%)', 'สาย': 'สายรถไฟฟ้า'},
+    text='cv_pct',
+)
+fig.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+fig.show()
+
+# %% [markdown]
+# ### 5.5 Rolling 30-Day Std — ความผันผวนที่เปลี่ยนแปลงตามเวลา
+#
+# แทน 0 ด้วย NaN ก่อน rolling เพื่อไม่ให้วันที่ไม่มีบริการบิดเบือน Std
+
+# %%
+# replace(0, np.nan) ก่อน rolling ป้องกัน Std ถูกดึงต่ำโดยวันที่ไม่มีข้อมูล
+rolling_std_df = (
+    pivot_df[rail_lines]
+    .replace(0, np.nan)
+    .rolling(30)
+    .std()
+    .dropna()
+)
+
+fig = px.line(
+    rolling_std_df.reset_index().melt(id_vars='date', var_name='สาย', value_name='Rolling Std'),
+    x='date',
+    y='Rolling Std',
+    color='สาย',
+    title='ความผันผวน Rolling 30 วันแต่ละสาย (Rolling 30-Day Standard Deviation)',
+    labels={'date': 'วันที่', 'Rolling Std': 'Standard Deviation (30D)'},
+)
+fig.show()
+
+# %% [markdown]
+# ### 5.6 รูปแบบการเดินทางตามวันในสัปดาห์ (Weekday Seasonality)
+#
+# **Raw:** ค่าเฉลี่ยจริง → เห็นขนาดของแต่ละสาย
+# **Normalized:** หาร mean ของแต่ละสาย → เห็น pattern จริงโดยไม่ถูกบิดเบือนโดย scale
+
+# %%
+day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+
+weekday_avg = (
+    pivot_df[rail_lines]
+    .assign(day=pivot_df.index.day_name())
+    .groupby('day')[rail_lines]
+    .mean()
+    .reindex(day_order)
+    .round()
+)
+
+print('=== ค่าเฉลี่ยผู้โดยสารแยกตามวันในสัปดาห์ ===')
+print(weekday_avg.to_string())
+
+# Raw Grouped Bar Chart
+fig = px.bar(
+    weekday_avg.reset_index().melt(id_vars='day', var_name='สาย', value_name='avg_passengers'),
+    x='day',
+    y='avg_passengers',
+    color='สาย',
+    barmode='group',
+    title='ค่าเฉลี่ยผู้โดยสารรายวันในสัปดาห์ — Raw (Avg Daily Ridership by Day of Week)',
+    labels={'avg_passengers': 'เฉลี่ยผู้โดยสาร', 'day': 'วัน', 'สาย': 'สายรถไฟฟ้า'},
+    category_orders={'day': day_order},
+)
+fig.show()
+
+# %%
+# Normalized: หาร mean ของแต่ละสายออก → ดู pattern โดยไม่ถูก scale ครอบงำ
+# ค่า > 1.0 = วันนั้นสูงกว่าค่าเฉลี่ยของสายนั้น, < 1.0 = ต่ำกว่า
+weekday_norm = weekday_avg.div(weekday_avg.mean())
+
+fig = px.line(
+    weekday_norm.reset_index().melt(id_vars='day', var_name='สาย', value_name='normalized'),
+    x='day',
+    y='normalized',
+    color='สาย',
+    markers=True,
+    title='รูปแบบรายวัน Normalized — ค่า > 1 = สูงกว่าค่าเฉลี่ยของสายนั้น',
+    labels={'normalized': 'Normalized Ridership (1.0 = avg)', 'day': 'วัน'},
+    category_orders={'day': day_order},
+)
+fig.add_hline(y=1.0, line_dash='dash', line_color='gray', annotation_text='ค่าเฉลี่ย (1.0)')
+fig.show()
+
+# %% [markdown]
+# ### 5.7 Rolling 30-Day YoY Growth — แนวโน้มการเติบโต
+
+# %%
+# หมายเหตุ: YoY นี้ใช้ total_passengers ซึ่งรวมทุกสาย
+# หากมีการเปิดสายใหม่ใน 2026 อาจทำให้ YoY ดูสูงกว่าความเป็นจริง
+pivot_df['rolling_30'] = pivot_df['total_passengers'].rolling(30).mean()
+pivot_df['rolling_30_yoy'] = pivot_df['rolling_30'].pct_change(periods=365) * 100
+
+yoy_plot = pivot_df.dropna(subset=['rolling_30_yoy'])
+
+if len(yoy_plot) > 0:
+    fig = px.line(
+        yoy_plot.reset_index(),
+        x='date',
+        y='rolling_30_yoy',
+        title='อัตราการเติบโต YoY แบบ Rolling 30 วัน (Rolling 30-Day YoY Growth %)',
+        labels={'rolling_30_yoy': 'YoY Growth (%)', 'date': 'วันที่'},
+    )
+    fig.add_hline(y=0, line_dash='dash', line_color='red', annotation_text='เส้นฐาน 0%')
+    fig.show()
+else:
+    print('⚠️ ข้อมูลไม่เพียงพอสำหรับ YoY Rolling')
+    print(f'   ต้องการ ≥ 395 วัน — ปัจจุบัน {len(pivot_df)} วัน')
+
+# %% [markdown]
+# ### 5.8 Clustered Correlation Heatmap (Log-transform) — ความสัมพันธ์ระหว่างสาย
+#
+# ใช้ log1p transform ก่อน corr เพื่อจัดการ heteroskedasticity ของ ridership
+# (ผู้โดยสารมักมี variance เพิ่มตาม level)
+# ใช้ distance = 1 - corr สำหรับ Hierarchical Clustering (ถูกต้องกว่าใช้ corr โดยตรง)
+
+# %%
+import scipy.cluster.hierarchy as sch
+
+# log1p transform ก่อน corr — สะท้อน relative movement ไม่ใช่ absolute
+corr = np.log1p(pivot_df[rail_lines].replace(0, np.nan)).corr()
+
+# Hierarchical Clustering ด้วย distance = 1 - corr
+try:
+    distance     = 1 - corr.fillna(0)
+    linkage      = sch.linkage(distance.values, method='average')
+    cluster_order = sch.leaves_list(linkage)
+    corr_sorted  = corr.iloc[cluster_order, cluster_order]
+except Exception:
+    corr_sorted = corr
+
+# zmin/zmax ต้องระบุชัดเจนเพื่อให้ scale ตรงกับความหมายของ correlation เสมอ
+fig = ff.create_annotated_heatmap(
+    z=np.round(corr_sorted.values, 2),
+    x=corr_sorted.columns.tolist(),
+    y=corr_sorted.index.tolist(),
+    colorscale='RdBu',
+    showscale=True,
+    zmin=-1,
+    zmax=1,
+)
+fig.update_layout(title='ความสัมพันธ์ผู้โดยสารระหว่างสาย — Clustered Log-transform (Ridership Correlation Heatmap)')
+fig.show()
+
+# %% [markdown]
+# ### 5.9 Correlation Pairs Ranking — Top คู่สายที่มีความสัมพันธ์สูงสุด
+
+# %%
+# ดึงเฉพาะ upper triangle (หลีกเลี่ยงค่าซ้ำ) แล้วจัดอันดับ
+corr_pairs = (
+    corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+    .stack()
+    .sort_values(ascending=False)
+    .reset_index()
+)
+corr_pairs.columns = ['สาย A', 'สาย B', 'Correlation']
+corr_pairs['Correlation'] = corr_pairs['Correlation'].round(3)
+
+print('=== Top 5 คู่สายที่มีความสัมพันธ์สูงสุด ===')
+print(corr_pairs.head(5).to_string(index=False))
+print('\n=== Bottom 5 คู่สายที่มีความสัมพันธ์ต่ำสุด ===')
+print(corr_pairs.tail(5).to_string(index=False))
+
+# %% [markdown]
+# ### 5.10 Lag Correlation — พฤติกรรมการเปลี่ยนสาย (Transfer Behaviour)
+#
+# ทดสอบทั้งสองทิศทาง:
+# - shift(-1): B วันถัดไป vs A วันนี้ → ทดสอบว่า A นำ B
+# - shift(+1): B วันก่อน vs A วันนี้ → ทดสอบว่า B นำ A
+# - threshold = 0.05 (แทน 0.02 เดิม) เพื่อลด false positive
+
+# %%
+lag_pairs_candidates = [
+    ('BTS',               'MRT Blue'),
+    ('BTS',               'MRT Purple'),
+    ('Airport Rail Link', 'BTS'),
+    ('MRT Blue',          'Airport Rail Link'),
+]
+lag_pairs = [(a, b) for a, b in lag_pairs_candidates if a in rail_lines and b in rail_lines]
+
+LAG_THRESHOLD = 0.05   # ต้องต่างกันอย่างน้อย 0.05 จึงถือว่ามี directional effect
+
+lag_results = []
+for line_a, line_b in lag_pairs:
+    s_a  = pivot_df[line_a]
+    s_b  = pivot_df[line_b]
+    lag0   = s_a.corr(s_b)
+    lag_n1 = s_a.corr(s_b.shift(-1))   # A นำ B (B วันถัดไป)
+    lag_p1 = s_a.corr(s_b.shift(1))    # B นำ A (B วันก่อน)
+
+    if lag_n1 > lag0 + LAG_THRESHOLD:
+        interpretation = f'{line_a} leads {line_b}'
+    elif lag_p1 > lag0 + LAG_THRESHOLD:
+        interpretation = f'{line_b} leads {line_a}'
+    else:
+        interpretation = 'Simultaneous demand'
+
+    lag_results.append({
+        'คู่สาย':       f'{line_a} ↔ {line_b}',
+        'Lag-0':        round(lag0,   3),
+        'Lag-1 (A→B)':  round(lag_n1, 3),
+        'Lag-1 (B→A)':  round(lag_p1, 3),
+        'สรุป':         interpretation,
+    })
+
+lag_df = pd.DataFrame(lag_results)
+print(f'=== Lag Correlation Analysis (Transfer Behaviour, threshold={LAG_THRESHOLD}) ===')
+print(lag_df.to_string(index=False))
+
+# %% [markdown]
+# ### 5.11 Ridership Market Share Over Time — สัดส่วนตลาดตามเวลา (Smoothed)
+#
+# ใช้ Rolling 14 วัน Smooth ก่อนแสดง เพื่อลด noise รายวันและเห็นแนวโน้มชัดขึ้น
+# - สายที่สัดส่วนเพิ่ม → เติบโตเร็วกว่า Network โดยรวม
+# - การเปลี่ยนแปลงกะทันหัน → อาจเกิดจากเปิดสายใหม่หรือปัญหาบริการ
+
+# %%
+# ป้องกัน divide-by-zero: แทน 0 ด้วย NaN ก่อนหาร
+total_per_day = pivot_df[rail_lines].sum(axis=1).replace(0, np.nan)
+share_time_df = (
+    pivot_df[rail_lines]
+    .div(total_per_day, axis=0)
+    .multiply(100)
+    .rolling(14)           # smooth 14 วัน — ลด noise ให้เห็นแนวโน้มชัด
+    .mean()
+    .dropna()
+)
+
+fig = px.area(
+    share_time_df.reset_index().melt(id_vars='date', var_name='สาย', value_name='Share (%)'),
+    x='date',
+    y='Share (%)',
+    color='สาย',
+    title='สัดส่วนตลาดของแต่ละสายรถไฟฟ้าตามเวลา — Smoothed 14D (Rail Line Market Share Over Time %)',
+    labels={'date': 'วันที่'},
+)
+fig.update_layout(yaxis_range=[0, 100])
+fig.show()
+
+# %% [markdown]
+# ### 5.12 Ridership Distribution Box Plot — การกระจายตัวของผู้โดยสาร
+#
+# - Median → ค่ากลางผู้โดยสารรายวัน
+# - IQR (Box width) → ความผันผวนปกติ
+# - Outlier dots → วันพิเศษที่ผู้โดยสารพุ่งหรือร่วงผิดปกติ
+
+# %%
+box_df = pivot_df[rail_lines].replace(0, np.nan).melt(var_name='สาย', value_name='ผู้โดยสาร')
+
+fig = px.box(
+    box_df,
+    x='สาย',
+    y='ผู้โดยสาร',
+    color='สาย',
+    title='การกระจายตัวของผู้โดยสารรายวันแต่ละสาย (Daily Ridership Distribution)',
+    labels={'ผู้โดยสาร': 'ผู้โดยสาร (คน)', 'สาย': 'สายรถไฟฟ้า'},
+)
+fig.show()
+
+# %% [markdown]
+# ### 5.13 Calendar Heatmap — ตารางปฏิทินผู้โดยสารรายวัน
+#
+# - แถบแนวนอนมืดวันเสาร์/อาทิตย์ → วันหยุดผู้โดยสารน้อย
+# - คอลัมน์แนวตั้งเย็น → สัปดาห์วันหยุดยาว (สงกรานต์, ปีใหม่)
+# - คอลัมน์สว่าง → สัปดาห์ผู้โดยสารพุ่งจากเหตุการณ์พิเศษ
+#
+# ใช้ aggfunc='median' (แทน mean) เพื่อความทนทานต่อ outlier รายวัน
+
+# %%
+cal_df = pivot_df[['total_passengers']].copy()
+cal_df['week']      = cal_df.index.isocalendar().week.astype(int)
+cal_df['weekday']   = cal_df.index.weekday    # 0 = Monday
+cal_df['year_week'] = (
+    cal_df.index.year.astype(str) + '-W' +
+    cal_df['week'].astype(str).str.zfill(2)
+)
+
+# aggfunc='median' — ทนทานต่อ outlier มากกว่า mean
+pivot_cal = cal_df.pivot_table(
+    index='weekday',
+    columns='year_week',
+    values='total_passengers',
+    aggfunc='median',
+)
+
+# reindex(range(7)) ให้แน่ใจว่าลำดับวัน 0–6 ถูกต้องก่อน map ป้ายกำกับ
+pivot_cal = pivot_cal.reindex(range(7))
+day_labels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+fig = go.Figure(go.Heatmap(
+    z=pivot_cal.values,
+    x=pivot_cal.columns,
+    y=day_labels,
+    colorscale='YlOrRd',
+    colorbar=dict(title='Median ผู้โดยสาร'),
+))
+fig.update_layout(
+    title='ปฏิทินผู้โดยสารรายวัน — ทุกสายรถไฟฟ้า (Daily Ridership Calendar Heatmap)',
+    xaxis_title='สัปดาห์',
+    yaxis_title='วันในสัปดาห์',
+)
+fig.show()
+
+# %% [markdown]
+# ### 5.14 Top 10 Ridership Days — วันที่ผู้โดยสารสูงสุด (พร้อม Day-of-Week Annotation)
+
+# %%
+# ค้นหา 10 วันที่มีผู้โดยสารรวมสูงสุด — มักสัมพันธ์กับเหตุการณ์พิเศษ
+top_days = (
+    pivot_df[['total_passengers']]
+    .nlargest(10, 'total_passengers')
+    .reset_index()
+)
+top_days['day_of_week'] = top_days['date'].dt.day_name()
+
+print('=== Top 10 วันที่มีผู้โดยสารสูงสุด ===')
+print(top_days.to_string(index=False))
+
+fig = px.bar(
+    top_days,
+    x='date',
+    y='total_passengers',
+    color='day_of_week',
+    title='Top 10 วันที่มีผู้โดยสารรวมสูงสุด (จากทุกสาย)',
+    labels={'total_passengers': 'ผู้โดยสารรวม (คน)', 'date': 'วันที่', 'day_of_week': 'วัน'},
+    text='total_passengers',
+)
+fig.update_traces(texttemplate='%{text:,}', textposition='outside')
+
+# Annotate ชื่อย่อวัน (Mon/Tue/...) บน bar เพื่อให้กรรมการเห็น pattern ทันที
+for _, row in top_days.iterrows():
+    fig.add_annotation(
+        x=row['date'],
+        y=row['total_passengers'],
+        text=row['day_of_week'][:3],
+        showarrow=False,
+        yshift=18,
+        font=dict(size=10, color='navy'),
+    )
+fig.show()
+
+# %% [markdown]
+# ### 5.15 สรุปข้อค้นพบ Phase 5 (Urban Rail Comparison Insights)
+
+# %%
+# สรุปเชิงปริมาณ — ส่งต่อใน Phase 9 (Insights & Conclusion)
+top_line       = rank_df.iloc[0]
+most_volatile  = rank_df.sort_values('cv_pct', ascending=False).iloc[0]
+least_volatile = rank_df.sort_values('cv_pct').iloc[0]
+
+# อัตราส่วน Weekday vs Weekend (เฉลี่ยทุกสาย)
+weekday_mean = weekday_avg.loc[['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']].mean().mean()
+weekend_mean = weekday_avg.loc[['Saturday', 'Sunday']].mean().mean()
+wd_we_ratio  = weekday_mean / weekend_mean if weekend_mean > 0 else float('nan')
+
+top_corr_pair = corr_pairs.iloc[0]
+
+print('=== Urban Rail Comparison Summary ===')
+print(f'สายผู้โดยสารเฉลี่ยสูงสุด:        {top_line["สาย"]} ({int(top_line["avg_daily"]):,} คน/วัน)')
+print(f'สายความผันผวนสูงสุด (CV):        {most_volatile["สาย"]} ({most_volatile["cv_pct"]:.1f}%)')
+print(f'สายความผันผวนต่ำสุด (CV):        {least_volatile["สาย"]} ({least_volatile["cv_pct"]:.1f}%)')
+print(f'อัตราส่วน Weekday/Weekend:       {wd_we_ratio:.2f}×  (weekday {weekday_mean:,.0f} vs weekend {weekend_mean:,.0f} คน/วัน)')
+print(f'คู่สายที่มีความสัมพันธ์สูงสุด:   {top_corr_pair["สาย A"]} ↔ {top_corr_pair["สาย B"]} (r = {top_corr_pair["Correlation"]:.3f})')
