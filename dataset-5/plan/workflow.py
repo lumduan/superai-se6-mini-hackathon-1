@@ -480,3 +480,185 @@ print(f'คอลัมน์ทั้งหมดใน pivot_df: {pivot_df.col
 # %%
 # แสดงตัวอย่างข้อมูล 7 วันแรกหลัง transformation (1 สัปดาห์)
 pivot_df[rail_lines + ['total_passengers', 'year', 'month', 'day_of_week', 'is_weekend']].head(7)
+
+# %% [markdown]
+# ---
+# ## Phase 4 — วิเคราะห์สัดส่วนการใช้ระบบขนส่ง (Modal Share Analysis)
+# ### Challenge 1: คนไทยเดินทางด้วยอะไรมากที่สุด?
+#
+# จัดกลุ่มสายรถไฟฟ้าเป็น 4 ระบบหลัก:
+# | ระบบ | สาย |
+# |------|-----|
+# | BTS  | BTS |
+# | MRT  | MRT Blue + Purple + Yellow + Pink |
+# | ARL  | Airport Rail Link |
+# | SRT  | SRT Red |
+
+# %% [markdown]
+# ### 4.1 คำนวณ Modal Share
+
+# %%
+# กำหนดกลุ่มสายรถไฟฟ้าแต่ละระบบ (กรองเฉพาะสายที่มีอยู่ใน pivot_df)
+modal_cols = {
+    'BTS': [c for c in ['BTS'] if c in pivot_df.columns],
+    'MRT': [c for c in ['MRT Blue', 'MRT Purple', 'MRT Yellow', 'MRT Pink'] if c in pivot_df.columns],
+    'ARL': [c for c in ['Airport Rail Link'] if c in pivot_df.columns],
+    'SRT': [c for c in ['SRT Red'] if c in pivot_df.columns],
+}
+# ตัด mode ที่ไม่มีข้อมูล — ป้องกัน KeyError ถ้า dataset เปลี่ยน schema
+modal_cols = {k: v for k, v in modal_cols.items() if v}
+
+print('กลุ่มสายรถไฟฟ้าแต่ละระบบ:')
+for mode, cols in modal_cols.items():
+    print(f'  {mode}: {cols}')
+
+# %%
+# คำนวณผู้โดยสารรวมและ % share ของแต่ละระบบ
+modal_total = pd.Series({
+    mode: pivot_df[cols].sum().sum()
+    for mode, cols in modal_cols.items()
+})
+
+modal_share = (modal_total / modal_total.sum() * 100).round(2)
+
+share_df = pd.DataFrame({
+    'mode':             modal_total.index,
+    'total_passengers': modal_total.values.astype(int),
+    'share_pct':        modal_share.values,
+}).sort_values('total_passengers', ascending=False).reset_index(drop=True)
+
+print('\nสัดส่วนการใช้ระบบขนส่ง:')
+print(share_df.to_string(index=False))
+
+# %% [markdown]
+# ### 4.2 กราฟที่ 1 — Pie Chart สัดส่วนผู้โดยสารแต่ละระบบ
+
+# %%
+# Chart 1: Modal Share Pie Chart (donut)
+# ใช้ total_passengers จริง — Plotly คำนวณ % เอง แม่นยำกว่าใช้ share_pct
+fig = px.pie(
+    share_df,
+    values='total_passengers',
+    names='mode',
+    title='สัดส่วนการใช้ระบบขนส่งทางราง (2025–2026)',
+    hole=0.4,
+    color_discrete_sequence=px.colors.qualitative.Set2,
+)
+fig.update_traces(
+    textposition='outside',
+    textinfo='percent+label',
+    pull=[0.02] * len(share_df),  # เว้นระยะแต่ละชิ้นเล็กน้อยเพื่อให้ label ไม่ชนกัน
+)
+fig.update_layout(showlegend=True)
+fig.show()
+
+# %% [markdown]
+# ### 4.3 กราฟที่ 2 — Stacked Area Chart สัดส่วนรายวัน
+
+# %%
+# คำนวณ modal share รายวัน (% ต่อวัน) เพื่อดูการเปลี่ยนแปลงตลอด 14 เดือน
+modal_daily = pd.DataFrame(
+    {mode: pivot_df[cols].sum(axis=1) for mode, cols in modal_cols.items()},
+    index=pivot_df.index,
+)
+modal_daily.index.name = 'date'  # กำหนด index name เพื่อให้ reset_index().melt() ทำงานถูกต้อง
+
+# หาร % share รายวัน — replace(0, pd.NA) ป้องกัน division by zero วันที่ไม่มีบริการ
+daily_sum = modal_daily.sum(axis=1).replace(0, pd.NA)
+modal_share_daily = (
+    modal_daily.div(daily_sum, axis=0)
+    .multiply(100)
+    .round(2)       # ลด floating noise ให้กราฟเรียบขึ้น
+    .sort_index()   # เรียงตามวันที่ก่อน plot เพื่อป้องกัน shuffle
+)
+
+# Chart 2: Modal Share Stacked Area Over Time
+fig = px.area(
+    modal_share_daily.reset_index().melt(
+        id_vars='date',
+        var_name='ระบบขนส่ง',
+        value_name='สัดส่วน (%)',
+    ),
+    x='date',
+    y='สัดส่วน (%)',
+    color='ระบบขนส่ง',
+    title='สัดส่วนการใช้ระบบขนส่งรายวัน (%)',
+    color_discrete_sequence=px.colors.qualitative.Set2,
+    labels={'date': 'วันที่'},
+)
+fig.update_layout(yaxis_range=[0, 100])
+fig.show()
+
+# %% [markdown]
+# ### 4.4 กราฟที่ 3 — YoY Growth Bar Chart (2025 → 2026)
+# สูตร: YoY Growth (%) = (เฉลี่ยต่อวัน₂₀₂₆ − เฉลี่ยต่อวัน₂₀₂₅) / เฉลี่ยต่อวัน₂₀₂₅ × 100
+#
+# **สำคัญ:** ใช้ **ค่าเฉลี่ยต่อวัน** แทนผลรวมรวม เพราะ 2026 มีข้อมูลเพียงบางเดือน
+# การใช้ total sum จะทำให้ 2026 ดูเล็กกว่าความเป็นจริงเสมอ
+
+# %%
+# คำนวณผู้โดยสาร **เฉลี่ยต่อวัน** ต่อระบบ ต่อปี (robust — เฉพาะ columns ที่มีอยู่จริง)
+all_modal_cols  = sum(modal_cols.values(), [])
+yearly_days     = pivot_df.groupby('year').size()  # จำนวนวันที่มีในแต่ละปี
+yearly_base_sum = pivot_df.groupby('year')[all_modal_cols].sum()
+
+# เฉลี่ยต่อวัน = ผลรวมต่อปี / จำนวนวันในปีนั้น
+yearly_base_avg = yearly_base_sum.div(yearly_days, axis=0)
+
+yearly_modal = pd.DataFrame({
+    mode: yearly_base_avg[cols].sum(axis=1)
+    for mode, cols in modal_cols.items()
+})
+
+available_years = yearly_modal.index.tolist()
+print('ปีที่มีในข้อมูล:', available_years)
+print(f'จำนวนวันต่อปี:\n{yearly_days.to_string()}')
+
+# %%
+# คำนวณ YoY growth เฉพาะเมื่อมีข้อมูลทั้ง 2 ปี
+if 2025 in available_years and 2026 in available_years:
+    growth = ((yearly_modal.loc[2026] - yearly_modal.loc[2025]) / yearly_modal.loc[2025]) * 100
+    growth_df = growth.reset_index()
+    growth_df.columns = ['mode', 'yoy_growth_pct']
+    growth_df['yoy_growth_pct'] = growth_df['yoy_growth_pct'].round(2)
+    growth_df = growth_df.sort_values('yoy_growth_pct', ascending=False).reset_index(drop=True)
+
+    print('\nYoY Growth (เฉลี่ยต่อวัน 2025 → 2026):')
+    print(growth_df.to_string(index=False))
+
+    # Chart 3: YoY Growth Bar Chart
+    fig = px.bar(
+        growth_df,
+        x='mode',
+        y='yoy_growth_pct',
+        color='yoy_growth_pct',
+        color_continuous_scale='RdYlGn',
+        title='การเติบโตของผู้โดยสารเทียบปีต่อปี (YoY Growth — เฉลี่ยต่อวัน 2025 → 2026)',
+        labels={'yoy_growth_pct': 'Growth (%)', 'mode': 'ระบบขนส่ง'},
+        text='yoy_growth_pct',
+    )
+    fig.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+    fig.add_hline(y=0, line_dash='dash', line_color='gray')
+    fig.show()
+else:
+    print('⚠️ ต้องการข้อมูลทั้งปี 2025 และ 2026 เพื่อคำนวณ YoY Growth')
+    print(f'   ปีที่มี: {available_years}')
+
+# %% [markdown]
+# ### 4.5 สรุปข้อค้นพบ (Modal Share Insights)
+
+# %%
+# สรุปเชิงปริมาณ — ใช้ใน Phase 9 (Insights & Conclusion)
+top_mode       = share_df.iloc[0]
+avg_daily_pass = modal_total.sum() / len(pivot_df)
+
+print('=== Modal Share Summary ===')
+print(f'ระบบขนส่งที่มีผู้โดยสารมากที่สุด: {top_mode["mode"]} ({top_mode["share_pct"]:.1f}%)')
+print(f'ผู้โดยสารรวมตลอด {len(pivot_df)} วัน:  {int(modal_total.sum()):,} คน')
+print(f'เฉลี่ยต่อวัน (ทุกระบบรวม):          {avg_daily_pass:,.0f} คน/วัน')
+
+if 2025 in available_years and 2026 in available_years:
+    fastest_growth = growth_df.iloc[0]
+    most_decline   = growth_df.iloc[-1]
+    print(f'\nระบบที่เติบโตเร็วที่สุด:  {fastest_growth["mode"]} ({fastest_growth["yoy_growth_pct"]:+.1f}%)')
+    print(f'ระบบที่หดตัวมากที่สุด:    {most_decline["mode"]} ({most_decline["yoy_growth_pct"]:+.1f}%)')
