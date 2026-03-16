@@ -25,7 +25,7 @@
 # %%
 # ติดตั้งแพ็คเกจที่จำเป็น (รันครั้งเดียวใน Colab)
 import subprocess
-subprocess.run(['pip', 'install', 'prophet', 'plotly', 'scikit-learn', '-q'], check=True)
+subprocess.run(['uv', 'pip', 'install', 'prophet', 'plotly', 'scikit-learn', '-q'], check=True)
 
 # %%
 # นำเข้าไลบรารีทั้งหมดที่ใช้ในการวิเคราะห์
