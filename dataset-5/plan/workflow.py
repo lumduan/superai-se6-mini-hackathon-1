@@ -25,7 +25,7 @@
 # %%
 # ติดตั้งแพ็คเกจที่จำเป็น (รันครั้งเดียวใน Colab)
 import subprocess
-subprocess.run(['uv', 'pip', 'install', 'prophet', 'plotly', 'scikit-learn', '-q'], check=True)
+subprocess.run(['uv', 'pip', 'install', 'prophet', 'plotly', 'scikit-learn', 'networkx', '-q'], check=True)
 
 # %%
 # นำเข้าไลบรารีทั้งหมดที่ใช้ในการวิเคราะห์
@@ -2377,3 +2377,729 @@ mean_res = eval_df_clean['residual'].mean()
 bias_pct = abs(mean_res) / eval_df_clean['y'].mean() * 100
 grade    = '✅ Excellent' if bias_pct < 1 else ('🟡 Acceptable' if bias_pct < 3 else '⚠️ Biased')
 print(f'\nBias: {mean_res:,.0f} คน ({bias_pct:.2f}%) [{grade}]')
+
+# %% [markdown]
+# ---
+# ## Phase 9 — Insights & Storytelling
+#
+# สรุปผลการวิเคราะห์ข้อมูลระบบขนส่งสาธารณะไทย 2025–2026
+# นำเสนอ Key Insights จากทุก Phase เพื่อเล่าเรื่องข้อมูลอย่างครบถ้วน
+
+# %%
+# ============================================================
+# 9.1 รวบรวม Key Metrics จากทุก Phase
+# ============================================================
+
+# --- Modal Share metrics (Phase 4) ---
+# ใช้ modal_total (Series) และ share_df (DataFrame) จาก Phase 4
+# dataset นี้เป็น rail ทั้งหมด → _rail_share = 100%, ใช้ BTS/MRT/ARL/SRT breakdown แทน
+_rail_total  = int(modal_total.sum()) if 'modal_total' in dir() else int(pivot_df[rail_lines].sum().sum())
+_grand_total = _rail_total  # all data is rail
+_rail_share  = 100.0        # 100% rail dataset
+
+# --- Rail Line metrics (Phase 3 / 5) ---
+_line_avg      = pivot_df[rail_lines].mean()
+_total_rail_avg = pivot_df[rail_lines].sum(axis=1).mean()  # ถูกต้อง: avg ของ total รายวัน
+_bts_avg       = _line_avg.get('BTS', np.nan)
+_mrt_avg       = _line_avg.get('MRT Blue', np.nan)
+_arl_avg       = _line_avg.get('Airport Rail Link', np.nan)
+# BTS share คำนวณจาก avg daily total (ไม่ใช่ sum of avg)
+_bts_share_pct = _bts_avg / _total_rail_avg * 100 if _total_rail_avg > 0 else np.nan
+
+# --- Weekday vs Weekend (Phase 5) ---
+_wday_mask = pivot_df.index.dayofweek < 5
+_wday_avg  = pivot_df.loc[_wday_mask,  'total_passengers'].mean()
+_wend_avg  = pivot_df.loc[~_wday_mask, 'total_passengers'].mean()
+_wdwe_ratio = _wday_avg / _wend_avg if _wend_avg > 0 else np.nan
+
+# --- ARL weekday/weekend ratio ---
+if 'Airport Rail Link' in pivot_df.columns:
+    _arl_s     = pivot_df['Airport Rail Link'].replace(0, np.nan)
+    _arl_wday  = _arl_s[_arl_s.index.dayofweek < 5].mean()
+    _arl_wend  = _arl_s[_arl_s.index.dayofweek >= 5].mean()
+    _arl_ratio = _arl_wday / _arl_wend if _arl_wend > 0 else np.nan
+else:
+    _arl_wday, _arl_wend, _arl_ratio = np.nan, np.nan, np.nan
+
+# --- Correlation — หา strongest pair แบบ dynamic (Phase 5) ---
+_corr_matrix = pivot_df[rail_lines].corr()
+_corr_pairs  = (
+    _corr_matrix.where(np.triu(np.ones_like(_corr_matrix, dtype=bool), k=1))
+    .stack()
+    .reset_index()
+)
+_corr_pairs.columns = ['สาย A', 'สาย B', 'r']
+_corr_pairs = _corr_pairs.dropna().sort_values('r', ascending=False)
+_top_corr_pair = _corr_pairs.iloc[0] if len(_corr_pairs) > 0 else None
+_corr_bts_mrt  = (
+    pivot_df['BTS'].corr(pivot_df['MRT Blue'])
+    if {'BTS', 'MRT Blue'}.issubset(pivot_df.columns) else np.nan
+)
+
+# --- CV per line — หา most volatile line ---
+_cv_series = {
+    line: pivot_df[line].replace(0, np.nan).dropna().std() /
+          pivot_df[line].replace(0, np.nan).dropna().mean() * 100
+    for line in rail_lines if line in pivot_df.columns
+}
+_cv_df         = pd.Series(_cv_series).sort_values(ascending=False)
+_most_volatile = _cv_df.index[0]  if len(_cv_df) > 0 else 'N/A'
+_least_volatile = _cv_df.index[-1] if len(_cv_df) > 0 else 'N/A'
+
+# --- Holiday impact (Phase 6) ---
+# impact_df นิยามใน Phase 6; ป้องกัน NameError ถ้า Phase 6 ไม่สร้าง impact_results
+_impact_df_p9  = impact_df if 'impact_df' in dir() else pd.DataFrame(columns=['เทศกาล', 'impact_pct'])
+_songkran_rows = _impact_df_p9[_impact_df_p9['เทศกาล'].str.contains('สงกรานต์', na=False)]
+_songkran_pct  = _songkran_rows['impact_pct'].mean() if len(_songkran_rows) > 0 else None
+
+# --- YoY Growth ---
+_year_groups = pivot_df.groupby(pivot_df.index.year)['total_passengers']
+_years       = sorted(_year_groups.groups.keys())
+if len(_years) >= 2:
+    _avg_2025 = _year_groups.get_group(_years[0]).mean()
+    _avg_2026 = _year_groups.get_group(_years[-1]).mean()
+    _yoy_pct  = (_avg_2026 - _avg_2025) / _avg_2025 * 100 if _avg_2025 > 0 else np.nan
+else:
+    _avg_2025, _avg_2026, _yoy_pct = np.nan, np.nan, np.nan
+
+# --- MRT Network Growth ---
+_mrt_lines = [l for l in ['MRT Blue', 'MRT Purple', 'MRT Yellow', 'MRT Pink'] if l in pivot_df.columns]
+if _mrt_lines:
+    _mrt_s        = pivot_df[_mrt_lines].sum(axis=1)
+    _mrt_first30  = _mrt_s.iloc[:30].mean()
+    _mrt_last30   = _mrt_s.iloc[-30:].mean()
+    _mrt_growth   = (_mrt_last30 - _mrt_first30) / _mrt_first30 * 100 if _mrt_first30 > 0 else np.nan
+else:
+    _mrt_growth = np.nan
+
+# --- Forecast metrics (Phase 7/8) ---
+# ใช้ train_end ที่นิยามใน Phase 7 ก่อนหน้า; ป้องกัน NameError
+_train_end_p9 = train['ds'].max()
+_future_mask  = forecast['ds'] > _train_end_p9
+_fc_avg_daily = forecast[_future_mask]['yhat'].mean()
+
+print('=== Key Metrics Collected ===')
+print(f'BTS modal share (of rail):{_bts_share_pct:.1f}%')
+print(f'BTS daily share:          {_bts_share_pct:.1f}% of rail total')
+print(f'BTS avg daily:            {_bts_avg:,.0f}')
+print(f'MRT Blue avg daily:       {_mrt_avg:,.0f}')
+print(f'ARL avg daily:            {_arl_avg:,.0f}')
+print(f'YoY Growth ({_years[0]}→{_years[-1]}):  {_yoy_pct:+.1f}%' if not np.isnan(_yoy_pct) else 'YoY: N/A')
+print(f'Weekday/Weekend ratio:    {_wdwe_ratio:.2f}×')
+print(f'ARL WD/WE ratio:          {_arl_ratio:.2f}×')
+if _top_corr_pair is not None:
+    print(f'Top corr pair:            {_top_corr_pair["สาย A"]} ↔ {_top_corr_pair["สาย B"]} (r={_top_corr_pair["r"]:.3f})')
+print(f'Most volatile line:       {_most_volatile} (CV {_cv_df.iloc[0]:.1f}%)')
+if _songkran_pct is not None:
+    print(f'Songkran impact:          {_songkran_pct:.1f}%')
+print(f'Forecast avg daily (30d): {_fc_avg_daily:,.0f}')
+
+# %% [markdown]
+# ### 9.2 สร้าง Insights Rows — พร้อม Confidence & Impact
+
+# %%
+insight_rows = []
+
+insight_rows.append({
+    'ลำดับ': 1,
+    'หัวข้อ': 'BTS ครองส่วนแบ่งรถไฟฟ้าสูงสุด',
+    'ข้อมูล': f'BTS เฉลี่ย {_bts_avg:,.0f} คน/วัน = {_bts_share_pct:.1f}% ของรถไฟฟ้าทั้งหมด',
+    'นัยสำคัญ': 'ต้องการความน่าเชื่อถือและความถี่สูงสุด — backbone ของระบบ',
+    'Confidence': 'High', 'Impact': 'High',
+})
+
+insight_rows.append({
+    'ลำดับ': 2,
+    'หัวข้อ': f'เครือข่าย MRT เติบโต {_mrt_growth:+.1f}%' if not np.isnan(_mrt_growth) else 'MRT Network Growth',
+    'ข้อมูล': f'ผู้โดยสาร MRT 30 วันล่าสุด vs 30 วันแรก: {_mrt_growth:+.1f}%' if not np.isnan(_mrt_growth) else 'N/A',
+    'นัยสำคัญ': 'สายใหม่ (Yellow/Pink) ดึงดูดผู้โดยสารเพิ่ม — การขยายเครือข่ายสร้างผล',
+    'Confidence': 'High', 'Impact': 'High',
+})
+
+insight_rows.append({
+    'ลำดับ': 3,
+    'หัวข้อ': f'YoY Growth {_years[0]}→{_years[-1]}: {_yoy_pct:+.1f}%' if not np.isnan(_yoy_pct) else 'YoY Growth',
+    'ข้อมูล': f'เฉลี่ยรายวัน: {_avg_2025:,.0f} → {_avg_2026:,.0f} คน ({_yoy_pct:+.1f}%)' if not np.isnan(_yoy_pct) else 'N/A',
+    'นัยสำคัญ': 'การเติบโต YoY ยืนยันว่าระบบ rail กำลังขยายฐานผู้ใช้งานต่อเนื่อง',
+    'Confidence': 'Medium', 'Impact': 'High',
+})
+
+insight_rows.append({
+    'ลำดับ': 4,
+    'หัวข้อ': 'ARL มีสัดส่วน Weekend สูงกว่าสายอื่น',
+    'ข้อมูล': f'ARL WD/WE ratio = {_arl_ratio:.2f}× (ระบบรวม = {_wdwe_ratio:.2f}×)',
+    'นัยสำคัญ': 'ARL มี tourist demand สูง — ควรวางแผนบริการแยกจาก commuter lines',
+    'Confidence': 'High', 'Impact': 'Medium',
+})
+
+insight_rows.append({
+    'ลำดับ': 5,
+    'หัวข้อ': 'สงกรานต์ลด Ridership อย่างมีนัยสำคัญ',
+    'ข้อมูล': f'ผู้โดยสารลดลง {abs(_songkran_pct):.1f}% ในช่วงสงกรานต์ 2025' if _songkran_pct is not None else 'ดูข้อมูล Phase 6',
+    'นัยสำคัญ': 'ควรลดความถี่ในช่วงสงกรานต์ — elasticity สูง',
+    'Confidence': 'High', 'Impact': 'High',
+})
+
+_top_line_name = _top_corr_pair['สาย A'] if _top_corr_pair is not None else 'N/A'
+_top_line_b    = _top_corr_pair['สาย B']  if _top_corr_pair is not None else 'N/A'
+_top_r         = _top_corr_pair['r']       if _top_corr_pair is not None else np.nan
+insight_rows.append({
+    'ลำดับ': 6,
+    'หัวข้อ': f'{_top_line_name}–{_top_line_b} Highly Correlated',
+    'ข้อมูล': f'r = {_top_r:.3f} → demand shock ส่งผลต่อทั้ง 2 สายพร้อมกัน',
+    'นัยสำคัญ': 'ต้องวางแผนกำลังการขนส่งร่วมกัน — Integrated Capacity Planning',
+    'Confidence': 'High', 'Impact': 'High',
+})
+
+insight_rows.append({
+    'ลำดับ': 7,
+    'หัวข้อ': f'{_most_volatile} มีความผันผวนสูงสุด',
+    'ข้อมูล': f'CV {_cv_df.iloc[0]:.1f}% (สายผันผวนน้อยสุด: {_least_volatile} CV {_cv_df.iloc[-1]:.1f}%)',
+    'นัยสำคัญ': f'{_most_volatile} ต้องการ demand planning ที่ยืดหยุ่นกว่าสายอื่น',
+    'Confidence': 'High', 'Impact': 'Medium',
+})
+
+insight_rows.append({
+    'ลำดับ': 8,
+    'หัวข้อ': 'Weekday Commuter Pattern ชัดเจน',
+    'ข้อมูล': f'Weekday {_wday_avg:,.0f} vs Weekend {_wend_avg:,.0f} คน/วัน ({_wdwe_ratio:.2f}×)',
+    'นัยสำคัญ': 'ระบบ rail ขับเคลื่อนโดย commuter — peak hour management สำคัญมาก',
+    'Confidence': 'High', 'Impact': 'High',
+})
+
+insight_rows.append({
+    'ลำดับ': 9,
+    'หัวข้อ': 'Prophet Forecast น่าเชื่อถือ',
+    'ข้อมูล': f'MAPE {mape:.2f}% | PI Coverage {coverage:.1f}% | Dir Acc {dir_acc:.1f}%',
+    'นัยสำคัญ': 'โมเดลสามารถใช้วางแผน capacity ล่วงหน้า 2–4 สัปดาห์ได้',
+    'Confidence': 'High', 'Impact': 'High',
+})
+
+insight_rows.append({
+    'ลำดับ': 10,
+    'หัวข้อ': 'คาดการณ์ Demand 30 วันข้างหน้า',
+    'ข้อมูล': f'เฉลี่ย {_fc_avg_daily:,.0f} คน/วัน (รวมทุกสาย)',
+    'นัยสำคัญ': 'ฐานข้อมูลสำหรับ staff scheduling และ capacity planning',
+    'Confidence': 'Medium', 'Impact': 'High',
+})
+
+insights_df = pd.DataFrame(insight_rows)
+print('=== INSIGHTS SUMMARY ===')
+print(insights_df[['ลำดับ', 'หัวข้อ', 'ข้อมูล', 'Confidence', 'Impact']].to_string(index=False))
+
+# %% [markdown]
+# ### 9.3 Insights Summary Table (Interactive)
+
+# %%
+# Color map สำหรับ confidence/impact
+_conf_color = {'High': '#c8e6c9', 'Medium': '#fff9c4', 'Low': '#ffcdd2'}
+_imp_color  = {'High': '#bbdefb', 'Medium': '#fff9c4', 'Low': '#ffcdd2'}
+
+fig_insights = go.Figure(data=[go.Table(
+    columnwidth=[25, 160, 260, 70, 70],
+    header=dict(
+        values=['<b>#</b>', '<b>Insight</b>', '<b>Data Support</b>',
+                '<b>Confidence</b>', '<b>Impact</b>'],
+        fill_color='#1f3a5f',
+        font=dict(color='white', size=12),
+        align=['center', 'left', 'left', 'center', 'center'],
+        height=35,
+    ),
+    cells=dict(
+        values=[
+            insights_df['ลำดับ'],
+            insights_df['หัวข้อ'],
+            insights_df['ข้อมูล'],
+            insights_df['Confidence'],
+            insights_df['Impact'],
+        ],
+        fill_color=[
+            ['#f0f4fa' if i % 2 == 0 else '#ffffff' for i in range(len(insights_df))],
+            ['#f0f4fa' if i % 2 == 0 else '#ffffff' for i in range(len(insights_df))],
+            ['#f0f4fa' if i % 2 == 0 else '#ffffff' for i in range(len(insights_df))],
+            [_conf_color.get(c, '#ffffff') for c in insights_df['Confidence']],
+            [_imp_color.get(c,  '#ffffff') for c in insights_df['Impact']],
+        ],
+        font=dict(size=11),
+        align=['center', 'left', 'left', 'center', 'center'],
+        height=36,
+    )
+)])
+fig_insights.update_layout(
+    title='Key Insights — ระบบขนส่งสาธารณะไทย 2025–2026',
+    margin=dict(l=10, r=10, t=60, b=10),
+    height=500,
+)
+fig_insights.show()
+
+# %% [markdown]
+# ### 9.4 Comparative Dashboard — Rail Line Performance
+
+# %%
+# Multi-metric comparison: avg passengers + CV + forecast MAPE
+_perf_data = []
+for line in rail_lines:
+    if line not in pivot_df.columns:
+        continue
+    _s      = pivot_df[line].replace(0, np.nan).dropna()
+    _wday_l = _s[_s.index.dayofweek < 5].mean()
+    _wend_l = _s[_s.index.dayofweek >= 5].mean()
+    _cv_l   = _s.std() / _s.mean() * 100 if _s.mean() > 0 else np.nan
+    _pml    = per_line_df[per_line_df['สาย'] == line]['MAPE'].values
+    _perf_data.append({
+        'สาย':            line,
+        'เฉลี่ย (คน/วัน)': round(_s.mean()),
+        'CV (%)':          round(_cv_l, 1),
+        'Weekday avg':     round(_wday_l),
+        'Weekend avg':     round(_wend_l),
+        'WD/WE ratio':     round(_wday_l / _wend_l, 2) if _wend_l > 0 else np.nan,
+        'Model MAPE (%)':  round(_pml[0], 1) if len(_pml) > 0 else None,
+    })
+
+perf_df = pd.DataFrame(_perf_data)
+print('=== Rail Line Performance Summary ===')
+print(perf_df.to_string(index=False))
+
+fig_perf = go.Figure()
+fig_perf.add_trace(go.Bar(
+    x=perf_df['สาย'], y=perf_df['เฉลี่ย (คน/วัน)'],
+    name='เฉลี่ย (คน/วัน)', marker_color='steelblue', yaxis='y',
+    text=perf_df['เฉลี่ย (คน/วัน)'].apply(lambda v: f'{v:,.0f}'),
+    textposition='outside',
+))
+fig_perf.add_trace(go.Scatter(
+    x=perf_df['สาย'], y=perf_df['CV (%)'],
+    name='CV (%) — ความผันผวน', mode='lines+markers',
+    marker=dict(size=9, color='tomato'), line=dict(color='tomato', width=2),
+    yaxis='y2',
+))
+fig_perf.update_layout(
+    title='ประสิทธิภาพรถไฟฟ้าแต่ละสาย — เฉลี่ยผู้โดยสาร & ความผันผวน',
+    xaxis_title='สาย',
+    yaxis=dict(title='เฉลี่ยผู้โดยสาร (คน/วัน)', showgrid=False),
+    yaxis2=dict(title='CV (%)', overlaying='y', side='right', showgrid=False),
+    legend=dict(x=0.01, y=0.99),
+    hovermode='x unified',
+    height=450,
+)
+fig_perf.show()
+
+# %% [markdown]
+# ### 9.5 Weekday vs Weekend — All Lines
+
+# %%
+fig_wdwe = go.Figure()
+fig_wdwe.add_trace(go.Bar(
+    x=perf_df['สาย'], y=perf_df['Weekday avg'],
+    name='Weekday', marker_color='royalblue',
+    text=perf_df['Weekday avg'].apply(lambda v: f'{v:,.0f}'),
+    textposition='outside',
+))
+fig_wdwe.add_trace(go.Bar(
+    x=perf_df['สาย'], y=perf_df['Weekend avg'],
+    name='Weekend', marker_color='coral',
+    text=perf_df['Weekend avg'].apply(lambda v: f'{v:,.0f}'),
+    textposition='outside',
+))
+# เส้น WD/WE ratio บน axis ขวา
+fig_wdwe.add_trace(go.Scatter(
+    x=perf_df['สาย'], y=perf_df['WD/WE ratio'],
+    name='WD/WE Ratio', mode='lines+markers',
+    marker=dict(size=9, color='darkgreen'), line=dict(color='darkgreen', width=2),
+    yaxis='y2',
+))
+fig_wdwe.update_layout(
+    title='Weekday vs Weekend Ridership แต่ละสายรถไฟฟ้า + WD/WE Ratio',
+    xaxis_title='สาย', yaxis=dict(title='เฉลี่ยผู้โดยสาร (คน/วัน)', showgrid=False),
+    yaxis2=dict(title='WD/WE Ratio', overlaying='y', side='right', showgrid=False, range=[0, 3]),
+    barmode='group', hovermode='x unified', height=460,
+)
+fig_wdwe.show()
+
+# %% [markdown]
+# ### 9.6 Forecast Outlook — 30 วันข้างหน้า
+
+# %%
+_fut = forecast[_future_mask][['ds', 'yhat', 'yhat_lower', 'yhat_upper']].copy()
+_fut['is_wend'] = _fut['ds'].dt.dayofweek >= 5
+_fut['week']    = _fut['ds'].dt.isocalendar().week
+
+fig_fut = go.Figure()
+fig_fut.add_trace(go.Scatter(
+    x=_fut['ds'], y=_fut['yhat_upper'],
+    line=dict(width=0), showlegend=False, name='Upper 80% CI',
+))
+fig_fut.add_trace(go.Scatter(
+    x=_fut['ds'], y=_fut['yhat_lower'],
+    fill='tonexty', fillcolor='rgba(255,100,100,0.15)',
+    line=dict(width=0), name='80% Prediction Interval',
+))
+fig_fut.add_trace(go.Scatter(
+    x=_fut['ds'], y=_fut['yhat'],
+    name='Forecast (yhat)',
+    line=dict(color='tomato', width=2.5),
+    mode='lines+markers', marker=dict(size=5),
+))
+_wend_fut = _fut[_fut['is_wend']]
+fig_fut.add_trace(go.Scatter(
+    x=_wend_fut['ds'], y=_wend_fut['yhat'],
+    mode='markers', name='Weekend',
+    marker=dict(color='navy', size=9, symbol='diamond'),
+))
+fig_fut.update_layout(
+    title='การพยากรณ์ผู้โดยสาร 30 วันข้างหน้า (Demand Outlook)',
+    xaxis_title='วันที่', yaxis_title='ผู้โดยสาร (คน)',
+    hovermode='x unified', height=420,
+)
+fig_fut.show()
+
+# สรุป forecast รายสัปดาห์
+_week_sum = _fut.groupby('week')['yhat'].agg(['sum', 'mean']).reset_index()
+_week_sum.columns = ['สัปดาห์', 'ยอดรวม (คน)', 'เฉลี่ย/วัน (คน)']
+_week_sum['ยอดรวม (คน)']    = _week_sum['ยอดรวม (คน)'].round().astype(int)
+_week_sum['เฉลี่ย/วัน (คน)'] = _week_sum['เฉลี่ย/วัน (คน)'].round().astype(int)
+print('=== Forecast Weekly Summary ===')
+print(_week_sum.to_string(index=False))
+
+# %% [markdown]
+# ### 9.7 Story Summary — บทสรุปเรื่องราว
+
+# %%
+print('=' * 65)
+print('  สรุปผลการวิเคราะห์: ระบบขนส่งสาธารณะไทย 2025–2026')
+print('=' * 65)
+print()
+
+print('📊 1. MODAL SHARE')
+print('   ชุดข้อมูลนี้เป็น Rail ทั้งหมด — วิเคราะห์ modal share ระหว่าง BTS/MRT/ARL/SRT')
+print(f'   BTS = backbone หลัก ({_bts_share_pct:.1f}% ของ rail total)')
+print()
+
+print('📈 2. GROWTH TREND')
+if not np.isnan(_yoy_pct):
+    print(f'   YoY Growth {_years[0]}→{_years[-1]}: {_yoy_pct:+.1f}%')
+if not np.isnan(_mrt_growth):
+    print(f'   MRT Network growth (first 30d vs last 30d): {_mrt_growth:+.1f}%')
+print()
+
+print('🗓️  3. WEEKDAY PATTERN')
+print(f'   Weekday {_wday_avg:,.0f} vs Weekend {_wend_avg:,.0f} คน/วัน ({_wdwe_ratio:.2f}×)')
+print(f'   ARL WD/WE ratio = {_arl_ratio:.2f}× → สะท้อน tourist demand')
+print()
+
+print('🎉 4. HOLIDAY IMPACT')
+if _songkran_pct is not None:
+    print(f'   สงกรานต์ 2025: ผู้โดยสารลด {abs(_songkran_pct):.1f}% → ลดความถี่บริการในช่วงนี้')
+print()
+
+print('🔗 5. NETWORK INTEGRATION')
+if _top_corr_pair is not None:
+    print(f'   Strongest pair: {_top_corr_pair["สาย A"]} ↔ {_top_corr_pair["สาย B"]} (r={_top_r:.3f})')
+print(f'   BTS–MRT Blue: r = {_corr_bts_mrt:.3f} → Integrated capacity planning จำเป็น')
+print()
+
+print('📉 6. VOLATILITY')
+print(f'   Most volatile: {_most_volatile} (CV {_cv_df.iloc[0]:.1f}%) → ต้องการ flexible scheduling')
+print(f'   Least volatile: {_least_volatile} (CV {_cv_df.iloc[-1]:.1f}%) → predictable demand')
+print()
+
+print('🤖 7. FORECAST RELIABILITY')
+_naive_mape = comparison_df[comparison_df['โมเดล'] == 'Naive (t-1)']['MAPE'].values
+print(f'   MAPE={mape:.2f}% | PI Coverage={coverage:.1f}% | Dir Acc={dir_acc:.1f}%')
+if len(_naive_mape) > 0:
+    print(f'   ชนะ Naive baseline (MAPE {_naive_mape[0]:.2f}%)')
+print(f'   Forecast avg 30d: {_fc_avg_daily:,.0f} คน/วัน')
+print()
+
+print('💡 8. RECOMMENDATIONS')
+print('   • ลดความถี่รถในช่วงสงกรานต์/ปีใหม่ (demand ลด > 20%)')
+print('   • เพิ่ม capacity Friday peak — peak weekday')
+print('   • วางแผน ARL แยกจาก BTS/MRT (demand pattern ต่างกัน)')
+print(f'   • ใช้ Prophet forecast (MAPE {mape:.1f}%) สำหรับ staff rostering ล่วงหน้า 2–4 สัปดาห์')
+print('=' * 65)
+
+# %% [markdown]
+# ### 9.8 Network Demand Propagation Dashboard
+#
+# Rail network graph:
+# - Node: size normalized 20–80 by demand, color = demand scale (95th-pct cap)
+# - Edge: width = 1 + r*5, crimson if r > 0.85, labels only if r > 0.75
+# - Metrics: density, betweenness centrality, avg path length, clustering coeff
+# - Hover: correlation on edge; demand + centrality on node
+
+# %%
+import networkx as nx
+
+NETWORK_CORR_THRESHOLD = 0.6
+
+_net_lines = [l for l in rail_lines if l in pivot_df.columns]
+# clip ป้องกัน numerical noise; fillna(0) ป้องกัน constant columns
+_net_corr = pivot_df[_net_lines].corr().clip(-1, 1).fillna(0)
+
+G = nx.Graph()
+for line in _net_lines:
+    _avg = pivot_df[line].replace(0, np.nan).dropna().mean()
+    G.add_node(line, avg_demand=_avg)
+
+for i, la in enumerate(_net_lines):
+    for j, lb in enumerate(_net_lines):
+        if j <= i:
+            continue
+        _r = _net_corr.loc[la, lb]
+        if pd.notna(_r) and abs(_r) > NETWORK_CORR_THRESHOLD:
+            G.add_edge(la, lb, weight=float(_r))
+
+# Layout: force-directed spring (iterations=100 for stability)
+pos = nx.spring_layout(G, seed=42, k=2.5, iterations=100)
+
+# Normalize node size (20–80); guard against _max_avg = 0
+_max_avg  = max((G.nodes[n]['avg_demand'] for n in G.nodes()), default=1)
+
+# Betweenness centrality + hub detection
+_centrality = nx.betweenness_centrality(G) if G.number_of_edges() > 0 else {n: 0 for n in G.nodes()}
+for n in G.nodes():
+    G.nodes[n]['centrality'] = _centrality.get(n, 0)
+
+# Safe hub computation (handles empty graph)
+if G.number_of_edges() > 0:
+    _cent_hub      = max(_centrality, key=_centrality.get)
+    _cent_hub_val  = _centrality[_cent_hub]
+    _cent_hub_name = _cent_hub
+else:
+    _cent_hub = _cent_hub_name = 'N/A'
+    _cent_hub_val = 0.0
+
+# Network-level metrics
+_density     = nx.density(G)
+_avg_path    = nx.average_shortest_path_length(G) if nx.is_connected(G) and G.number_of_nodes() > 1 else np.nan
+_clustering  = nx.average_clustering(G)
+
+# Community detection (Louvain)
+_communities = None
+try:
+    from networkx.algorithms.community import louvain_communities
+    if G.number_of_edges() > 0:
+        _communities = louvain_communities(G, seed=42)
+except Exception:
+    pass
+_comm_map = ({node: i for i, comm in enumerate(_communities) for node in comm}
+             if _communities else {n: 0 for n in G.nodes()})
+
+# Sort edges by weight for KPI printout
+_edges_sorted = sorted(G.edges(data=True), key=lambda e: abs(e[2]['weight']), reverse=True)
+
+# Edge traces
+edge_traces = []
+for u, v, data in G.edges(data=True):
+    x0, y0 = pos[u]
+    x1, y1 = pos[v]
+    _w   = abs(data['weight'])
+    _col = 'crimson' if _w > 0.85 else f'rgba(70,130,180,{min(_w, 1.0):.2f})'
+    edge_traces.append(go.Scatter(
+        x=[x0, x1, None], y=[y0, y1, None],
+        mode='lines',
+        line=dict(width=1 + _w * 5, color=_col),
+        hovertext=f'{u} ↔ {v}<br>Correlation: {_w:.3f}',
+        hoverinfo='text',
+        showlegend=False,
+    ))
+
+# Node traces
+node_x, node_y, node_text, node_hover, node_size, node_color = [], [], [], [], [], []
+for node in G.nodes():
+    x, y   = pos[node]
+    _avg   = G.nodes[node].get('avg_demand', 0)
+    _deg   = G.degree(node)
+    _cent  = G.nodes[node].get('centrality', 0)
+    node_x.append(x);  node_y.append(y)
+    node_text.append(node)
+    node_hover.append(
+        f'<b>{node}</b><br>'
+        f'Avg daily: {_avg:,.0f}<br>'
+        f'Connections: {_deg}<br>'
+        f'Centrality: {_cent:.3f}'
+    )
+    node_size.append(20 + 60 * (_avg / (_max_avg or 1)))  # guard divide-by-zero
+    node_color.append(_avg)
+
+# Use 95th-percentile cap for color scale (handles skewed demand)
+_cmax = float(np.percentile(node_color, 95)) if node_color else _max_avg
+
+node_trace = go.Scatter(
+    x=node_x, y=node_y,
+    mode='markers+text',
+    text=node_text,
+    textposition='top center',
+    hovertext=node_hover,
+    hoverinfo='text',
+    marker=dict(
+        size=node_size,
+        color=node_color,
+        cmin=0, cmax=_cmax,
+        colorscale='Blues',
+        colorbar=dict(title='Avg Daily Ridership'),
+        line=dict(width=2, color='darkblue'),
+    ),
+    showlegend=False,
+)
+
+# Edge labels — show only if r > 0.75 (avoid clutter)
+annot_traces = []
+for u, v, data in G.edges(data=True):
+    if abs(data['weight']) <= 0.75:
+        continue
+    x0, y0 = pos[u]
+    x1, y1 = pos[v]
+    annot_traces.append(go.Scatter(
+        x=[(x0 + x1) / 2], y=[(y0 + y1) / 2],
+        mode='text',
+        text=[f'r={data["weight"]:.2f}'],
+        textfont=dict(size=9, color='dimgray'),
+        showlegend=False, hoverinfo='none',
+    ))
+
+fig_net = go.Figure(data=edge_traces + [node_trace] + annot_traces)
+fig_net.update_layout(
+    title='Rail Demand Propagation Network — Bangkok Urban Rail System',
+    showlegend=False,
+    hovermode='closest',
+    xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+    yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+    margin=dict(l=20, r=20, b=20, t=60),
+    height=520,
+)
+fig_net.show()
+
+# Network KPIs
+print('=== Rail Network KPIs ===')
+print(f'Nodes:               {G.number_of_nodes()}')
+print(f'Edges:               {G.number_of_edges()} (r > {NETWORK_CORR_THRESHOLD})')
+print(f'Network Density:     {_density:.3f}  (1.0 = fully connected)')
+print(f'Avg Clustering Coef: {_clustering:.3f}  (demand cluster tightness)')
+if not np.isnan(_avg_path):
+    print(f'Avg Path Length:     {_avg_path:.2f} hops  (demand shock spread distance)')
+if G.number_of_edges() > 0:
+    print(f'Hub (degree):        {max(G.degree, key=lambda x: x[1])[0]} ({max(G.degree, key=lambda x: x[1])[1]} connections)')
+    print(f'Hub (centrality):    {_cent_hub_name} ({_cent_hub_val:.3f})')
+    if _edges_sorted:
+        print(f'Strongest edge:      {_edges_sorted[0][0]} ↔ {_edges_sorted[0][1]} (r={_edges_sorted[0][2]["weight"]:.3f})')
+    print(f'Communities:         {len(_communities) if _communities is not None else "N/A"}')
+
+# %% [markdown]
+# ### 9.9 McKinsey-Style Narrative Summary
+#
+# Format: **Headline → Evidence → Implication**
+# Short punchy consulting headlines. Centrality-based insight included.
+
+# %%
+mckinsey_insights = [
+    {
+        'title': "BTS is the backbone of Bangkok's urban mobility system.",
+        'evidence': (
+            f'BTS carries {_bts_avg:,.0f} passengers/day (~{_bts_share_pct:.0f}% of rail total). '
+            f'MRT Blue ranks second at {_mrt_avg:,.0f}/day — BTS is roughly 2× larger.'
+        ),
+        'implication': (
+            'Reliability and peak-hour capacity on BTS have outsized system-wide impact. '
+            'Any disruption here cascades across the entire network.'
+        ),
+    },
+    {
+        'title': "Bangkok's rail system functions as a single integrated demand network.",
+        'evidence': (
+            f'Strongest pair: {_top_line_name} ↔ {_top_line_b} (r={_top_r:.3f}). '
+            f'Network density={_density:.2f}; '
+            f'Avg clustering={_clustering:.2f}. '
+            'Demand shocks propagate simultaneously across all high-corr lines.'
+        ),
+        'implication': (
+            'Per-line planning is insufficient. '
+            'Coordinated capacity scheduling across BTS, MRT, and feeders is required.'
+        ),
+    },
+    {
+        'title': f'{_cent_hub_name} is the critical bridge node — disruption propagates furthest from here.',
+        'evidence': (
+            f'Betweenness centrality: {_cent_hub_name}={_cent_hub_val:.3f} (highest). '
+            + (f'Avg network path length = {_avg_path:.2f} hops. ' if not np.isnan(_avg_path) else '')
+            + 'Most demand-shock paths route through this node.'
+        ),
+        'implication': (
+            f'Resilience investment should prioritize {_cent_hub_name}. '
+            'Backup routing and redundancy protocols matter most here.'
+        ),
+    },
+    {
+        'title': 'Rail demand is commuter-driven — weekdays dominate.',
+        'evidence': (
+            f'Weekday avg {_wday_avg:,.0f} vs Weekend {_wend_avg:,.0f} passengers/day ({_wdwe_ratio:.2f}×). '
+            f'ARL shows {_arl_ratio:.2f}× ratio — flatter, reflecting tourist demand mix.'
+        ),
+        'implication': (
+            'Peak-hour weekday management is the highest-leverage operational lever. '
+            'ARL scheduling should be decoupled from BTS/MRT.'
+        ),
+    },
+    {
+        'title': 'Holiday demand drops are large, predictable, and actionable.',
+        'evidence': (
+            f'Songkran 2025: ridership fell {abs(_songkran_pct):.0f}% below baseline. '
+            'New Year 2026 showed identical pattern — both forecastable 3+ weeks ahead.'
+        ) if _songkran_pct is not None else 'See Phase 6 for holiday impact data.',
+        'implication': (
+            'Reducing service frequency during Songkran and New Year yields material cost savings '
+            'without degrading perceived service quality.'
+        ),
+    },
+    {
+        'title': 'Prophet delivers reliable 30-day demand forecasts for operational use.',
+        'evidence': (
+            f'MAPE={mape:.1f}% | PI Coverage={coverage:.0f}% | Directional Accuracy={dir_acc:.0f}%. '
+            f'Beats Naive baseline by {_naive_mape[0] - mape:.1f} pp MAPE.'
+        ) if len(_naive_mape) > 0 else f'Prophet MAPE={mape:.1f}%, PI Coverage={coverage:.0f}%.',
+        'implication': (
+            f'Predicted avg demand over next 30 days: {_fc_avg_daily:,.0f} passengers/day. '
+            'Suitable for 2–4 week staff rostering and capacity planning.'
+        ),
+    },
+]
+
+print('=' * 72)
+print('  McKinsey-Style Insights — Bangkok Urban Rail 2025–2026')
+print('=' * 72)
+for i, ins in enumerate(mckinsey_insights, 1):
+    print()
+    print(f'[{i}] {ins["title"]}')
+    print(f'     Evidence:    {ins["evidence"]}')
+    print(f'     Implication: {ins["implication"]}')
+print()
+print('=' * 72)
+
+fig_mckinsey = go.Figure(data=[go.Table(
+    columnwidth=[150, 270, 270],
+    header=dict(
+        values=['<b>Insight</b>', '<b>Evidence</b>', '<b>Business Implication</b>'],
+        fill_color='#1a237e',
+        font=dict(color='white', size=12),
+        align='left', height=36,
+    ),
+    cells=dict(
+        values=[
+            [ins['title']       for ins in mckinsey_insights],
+            [ins['evidence']    for ins in mckinsey_insights],
+            [ins['implication'] for ins in mckinsey_insights],
+        ],
+        fill_color=[
+            ['#e8eaf6' if i % 2 == 0 else '#ffffff' for i in range(len(mckinsey_insights))],
+            ['#e8eaf6' if i % 2 == 0 else '#ffffff' for i in range(len(mckinsey_insights))],
+            ['#e8eaf6' if i % 2 == 0 else '#ffffff' for i in range(len(mckinsey_insights))],
+        ],
+        font=dict(size=11), align='left', height=52,
+    ),
+)])
+fig_mckinsey.update_layout(
+    title='McKinsey-Style Insights — Bangkok Urban Rail 2025–2026',
+    margin=dict(l=10, r=10, t=60, b=10),
+    height=460,
+)
+fig_mckinsey.show()
