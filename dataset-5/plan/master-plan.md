@@ -101,18 +101,31 @@ Filter conditions:
 
 ---
 
-## Check Data Quality
+## Data Validation
 
-Check:
-- Missing values
-- Zero values
-- Duplicate rows
-
-Example:
+Government datasets often contain duplicates, negative values, and unrealistic counts. Always validate before analysis.
 
 ```python
-df.isna().sum()
+# 1. Missing values per column
+print(df.isna().sum())
+
+# 2. Duplicate rows
+print("Duplicates:", df.duplicated().sum())
+df = df.drop_duplicates()
+
+# 3. Negative passenger counts (should never occur)
+neg_mask = df["ปริมาณ"] < 0
+print("Negative values:", neg_mask.sum())
+df = df[~neg_mask]
+
+# 4. Descriptive statistics — catch unrealistic outliers
+print(df["ปริมาณ"].describe())
 ```
+
+What to look for in `.describe()`:
+- `min` should be ≥ 0
+- `max` should not be astronomically higher than `mean` (suggests data entry error)
+- `std` much larger than `mean` → heavy outliers worth investigating
 
 ---
 
@@ -146,15 +159,29 @@ Ensure continuous daily time series (critical for Prophet):
 ```python
 # Reindex to fill any missing dates
 pivot_df = pivot_df.asfreq("D")
+```
 
-# Fill missing passenger counts with 0
+Choose the right fill strategy based on the **reason** for the missing value:
+
+| Scenario | Fill Strategy | Code |
+|----------|--------------|------|
+| No service on that day (e.g., system shutdown) | Fill with 0 | `pivot_df.fillna(0)` |
+| Data recording gap (service ran, just not logged) | Interpolate | `pivot_df.interpolate(method="time")` |
+
+For this dataset, rail systems operate daily so **interpolation** is safer for small gaps; **zero-fill** only for confirmed service suspensions:
+
+```python
+# Interpolate short gaps (≤ 3 consecutive missing days)
+pivot_df = pivot_df.interpolate(method="time", limit=3)
+
+# Zero-fill any remaining NaN (confirmed no-service days)
 pivot_df = pivot_df.fillna(0)
 ```
 
 Why this matters:
 - Prophet requires a **gapless** date sequence
-- Missing days cause incorrect trend and seasonality fitting
-- Zero-filling is appropriate for days when service was not recorded
+- Blindly zero-filling distorts trend and seasonality fitting
+- Interpolation preserves realistic ridership continuity
 
 ---
 
@@ -188,16 +215,30 @@ Identify the most used transportation system.
 
 ---
 
-## Calculate Total Passengers
+## Calculate Total & Normalized Passengers
 
 ```python
-modal_total = {
+import pandas as pd
+
+modal_total = pd.Series({
     "BTS": pivot_df["BTS"].sum(),
     "MRT": pivot_df[["MRT Blue", "MRT Purple", "MRT Yellow", "MRT Pink"]].sum().sum(),
     "ARL": pivot_df["ARL"].sum(),
     "SRT": pivot_df["SRT Red"].sum()
-}
+})
+
+# Normalized percentage share
+modal_share = (modal_total / modal_total.sum() * 100).round(2)
+
+share_df = pd.DataFrame({
+    "mode": modal_total.index,
+    "total_passengers": modal_total.values,
+    "share_pct": modal_share.values
+})
+print(share_df)
 ```
+
+Using percentage share instead of raw totals makes the pie chart meaningful even when comparing systems of very different scales.
 
 ---
 
@@ -287,6 +328,83 @@ Passenger stability metric: **standard deviation**
 
 ---
 
+## Weekday Seasonality Analysis
+
+Reveal commuter behavior patterns by day of week:
+
+```python
+rail_lines = ["BTS", "MRT Blue", "MRT Purple", "ARL", "SRT Red"]
+
+weekday_avg = (
+    pivot_df[rail_lines]
+    .assign(day=pivot_df.index.day_name())
+    .groupby("day")[rail_lines]
+    .mean()
+    .reindex(["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"])
+)
+
+import plotly.express as px
+fig = px.bar(
+    weekday_avg.reset_index().melt(id_vars="day"),
+    x="day", y="value", color="variable", barmode="group",
+    title="Average Daily Ridership by Day of Week",
+    labels={"value": "Avg Passengers", "day": "Day", "variable": "Line"}
+)
+fig.show()
+```
+
+Expected finding: weekday ridership significantly higher than weekend for commuter lines (BTS, MRT); ARL may show stronger weekend/holiday patterns.
+
+---
+
+## 30-Day Rolling Growth
+
+Visualize momentum and growth trends:
+
+```python
+pivot_df["total_passengers"] = pivot_df[rail_lines].sum(axis=1)
+pivot_df["rolling_30"] = pivot_df["total_passengers"].rolling(30).mean()
+pivot_df["rolling_30_yoy"] = pivot_df["rolling_30"].pct_change(periods=365) * 100
+
+fig = px.line(
+    pivot_df.dropna(subset=["rolling_30_yoy"]),
+    y="rolling_30_yoy",
+    title="Rolling 30-Day YoY Growth Rate (%)",
+    labels={"rolling_30_yoy": "YoY Growth (%)", "index": "Date"}
+)
+fig.add_hline(y=0, line_dash="dash", line_color="red")
+fig.show()
+```
+
+---
+
+## Ridership Correlation Between Lines
+
+Understand whether rail lines share ridership patterns (e.g., do commuters transfer between BTS and MRT?):
+
+```python
+import plotly.figure_factory as ff
+import numpy as np
+
+corr = pivot_df[rail_lines].corr()
+
+fig = ff.create_annotated_heatmap(
+    z=np.round(corr.values, 2),
+    x=corr.columns.tolist(),
+    y=corr.index.tolist(),
+    colorscale="RdBu",
+    showscale=True
+)
+fig.update_layout(title="Ridership Correlation Heatmap Between Rail Lines")
+fig.show()
+```
+
+Interpretation:
+- **High correlation (> 0.8)** → lines share the same demand drivers (e.g., economic activity, holidays)
+- **Low correlation (< 0.3)** → lines serve different commuter segments
+
+---
+
 # Phase 6 — Event Detection
 
 ## Objective
@@ -321,6 +439,41 @@ $$z = \frac{x - \mu}{\sigma}$$
 
 If $|z| > 3$ → anomaly detected
 
+```python
+from scipy import stats
+
+pivot_df["z_score"] = stats.zscore(pivot_df["total_passengers"].fillna(0))
+pivot_df["is_anomaly"] = pivot_df["z_score"].abs() > 3
+```
+
+## Anomaly Visualization
+
+Highlight anomaly points on the ridership trend:
+
+```python
+import plotly.graph_objects as go
+
+normal = pivot_df[~pivot_df["is_anomaly"]]
+abnormal = pivot_df[pivot_df["is_anomaly"]]
+
+fig = go.Figure()
+fig.add_trace(go.Scatter(
+    x=pivot_df.index, y=pivot_df["total_passengers"],
+    name="Total Passengers", line=dict(color="steelblue")
+))
+fig.add_trace(go.Scatter(
+    x=pivot_df.index, y=pivot_df["rolling_7"],
+    name="7-Day Rolling Avg", line=dict(color="orange", dash="dash")
+))
+fig.add_trace(go.Scatter(
+    x=abnormal.index, y=abnormal["total_passengers"],
+    mode="markers", name="Anomaly",
+    marker=dict(color="red", size=10, symbol="x")
+))
+fig.update_layout(title="Ridership Trend with Anomaly Highlights")
+fig.show()
+```
+
 ---
 
 ## Event Mapping
@@ -342,7 +495,17 @@ Match anomalies with events:
 
 Predict passenger demand for the next 30 days.
 
-Facebook Prophet is a time-series forecasting model developed by Meta that decomposes a time series into **trend**, **seasonality**, and **holiday effects**.
+Facebook Prophet is a time-series forecasting model developed by Meta. It decomposes the time series as the **sum of its components**:
+
+$$y(t) = g(t) + s(t) + h(t) + \varepsilon_t$$
+
+where:
+- $g(t)$ = trend (piecewise linear or logistic growth)
+- $s(t)$ = seasonality (weekly, yearly Fourier series)
+- $h(t)$ = holiday effects
+- $\varepsilon_t$ = noise
+
+This formulation matches our dataset perfectly: daily ridership has clear weekly seasonality, yearly patterns, and holiday dips.
 
 Prophet expects a dataset with two columns:
 
@@ -399,7 +562,8 @@ model = Prophet(
     yearly_seasonality=True,
     weekly_seasonality=True,
     daily_seasonality=False,
-    changepoint_prior_scale=0.05,  # controls trend flexibility
+    seasonality_mode="multiplicative",  # ridership scales with trend
+    changepoint_prior_scale=0.05,       # controls trend flexibility
     holidays=holidays
 )
 
@@ -462,6 +626,7 @@ for line in lines:
         yearly_seasonality=True,
         weekly_seasonality=True,
         daily_seasonality=False,
+        seasonality_mode="multiplicative",
         changepoint_prior_scale=0.05,
         holidays=holidays
     )
@@ -534,6 +699,41 @@ fig.show()
 
 ---
 
+## Residual Analysis
+
+Analyze the forecast errors to check for **systematic model bias**:
+
+```python
+import plotly.express as px
+import numpy as np
+
+eval_df["residual"] = eval_df["y"] - eval_df["yhat"]
+
+# 1. Residuals over time — should be randomly scattered around 0
+fig1 = px.scatter(
+    eval_df, x="ds", y="residual",
+    title="Residuals Over Time",
+    labels={"residual": "Residual (Actual − Forecast)"}
+)
+fig1.add_hline(y=0, line_dash="dash", line_color="red")
+fig1.show()
+
+# 2. Residual distribution — should be approximately normal and centred at 0
+fig2 = px.histogram(
+    eval_df, x="residual", nbins=20,
+    title="Residual Distribution",
+    labels={"residual": "Residual"}
+)
+fig2.show()
+```
+
+What to look for:
+- **Residuals randomly around 0** → model is unbiased ✅
+- **Systematic upward/downward drift** → model is missing a trend component ⚠️
+- **Clusters of large residuals on specific dates** → likely holiday effects not captured ⚠️
+
+---
+
 # Phase 9 — Insights & Storytelling
 
 Summarize key findings.
@@ -558,6 +758,12 @@ Prophet forecasts show continued growth in rail passenger demand over the next 3
 **Insight 6**  
 Model evaluation (MAE / RMSE / MAPE) confirms forecast reliability within an acceptable margin.
 
+**Insight 7**  
+Weekday ridership is significantly higher than weekends for BTS and MRT, confirming commuter-driven demand.
+
+**Insight 8**  
+Ridership correlation between BTS and MRT Blue is high, suggesting shared demand drivers across interconnected lines.
+
 ---
 
 # Notebook Structure
@@ -566,13 +772,13 @@ Final notebook structure:
 
 1. Introduction
 2. Load Dataset
-3. Data Cleaning
+3. Data Cleaning & Validation
 4. Data Transformation
 5. Modal Share Analysis
-6. Urban Rail Comparison
+6. Urban Rail Comparison + Seasonality + Correlation
 7. Event Detection
 8. Prophet Forecast
-9. Model Evaluation
+9. Model Evaluation & Residual Analysis
 10. Key Insights
 
 ---
@@ -587,12 +793,16 @@ Final notebook structure:
 4. Ridership Trend (Multi-line)
 5. Rail Line Comparison
 6. Rolling Trend Chart
-7. Anomaly Detection Plot
-8. Forecast Plot (total + per line)
-9. Forecast vs Actual Evaluation Plot
-10. Prophet Components Plot (trend + seasonality)
+7. Anomaly Detection Plot (with highlighted anomaly points)
+8. Weekday Ridership Bar Chart
+9. Rolling 30-Day YoY Growth Line Chart
+10. Ridership Correlation Heatmap
+11. Forecast Plot (total + per line)
+12. Forecast vs Actual Evaluation Plot
+13. Prophet Components Plot (trend + seasonality)
+14. Residual Distribution + Residual Over Time
 
-**Total:** 10–12 visualizations
+**Total:** 13–15 visualizations
 
 ---
 
