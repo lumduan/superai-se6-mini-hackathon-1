@@ -298,3 +298,185 @@ print(rail_df['ยานพาหนะ/ท่า'].value_counts())
 # สรุปช่วงวันที่และความครบถ้วนของข้อมูลทางราง
 print(f'\nช่วงวันที่ข้อมูลทางราง: {rail_df["date"].min().date()} → {rail_df["date"].max().date()}')
 print(f'จำนวนวันที่ไม่ซ้ำ: {rail_df["date"].nunique()} วัน')
+
+# %% [markdown]
+# ---
+# ## Phase 3 — แปลงรูปแบบข้อมูล (Data Transformation)
+#
+# เปลี่ยนจาก **long format** (date | transport | passengers)
+# เป็น **wide format** (date × rail line) เพื่อให้ Prophet และ correlation analysis ใช้งานได้
+
+# %% [markdown]
+# ### 3.1 แปลงชื่อยานพาหนะจากภาษาไทยเป็นภาษาอังกฤษ
+# กำหนด mapping เฉพาะ **7 สายรถไฟฟ้าในเมือง** ที่เป็นเป้าหมายของการวิเคราะห์
+# ไม่รวมรถไฟแห่งชาติ (รถไฟ, รถไฟ ขาเข้า/ขาออกประเทศ) เพราะเป็นระบบต่างประเภท
+
+# %%
+# mapping ชื่อยานพาหนะภาษาไทย → ชื่อคอลัมน์ภาษาอังกฤษ
+vehicle_map = {
+    'รถไฟฟ้า BTS':         'BTS',
+    'รถไฟฟ้าสายสีน้ำเงิน': 'MRT Blue',
+    'รถไฟฟ้าสายสีม่วง':    'MRT Purple',
+    'รถไฟฟ้าสายสีเหลือง':  'MRT Yellow',
+    'รถไฟฟ้าสายสีชมพู':    'MRT Pink',
+    'รถไฟฟ้า ARL':         'Airport Rail Link',
+    'รถไฟฟ้าสายสีแดง':     'SRT Red',
+}
+
+# แปลงชื่อยานพาหนะ — ค่าที่ไม่อยู่ใน mapping (รถไฟแห่งชาติ) กลายเป็น NaN
+rail_df = rail_df.copy()
+rail_df['line'] = rail_df['ยานพาหนะ/ท่า'].map(vehicle_map)
+
+# แสดงรายการยานพาหนะที่ตัดออก เพื่อความโปร่งใสของ pipeline
+unmapped = rail_df[rail_df['line'].isna()]['ยานพาหนะ/ท่า'].unique()
+print('ยานพาหนะที่ตัดออกจากการวิเคราะห์ (ไม่ใช่ urban rail):')
+for v in unmapped:
+    print(f'  - {v}')
+
+# กรองเฉพาะ 7 สายรถไฟฟ้าในเมืองที่ map แล้ว
+rail_df = rail_df[rail_df['line'].notna()].copy()
+
+# ตรวจสอบว่ายังมีข้อมูลเหลืออยู่ — หาก vehicle_map ผิดพลาดจะรู้ได้ทันที
+assert len(rail_df) > 0, 'ไม่มีข้อมูล urban rail หลัง mapping — ตรวจสอบ vehicle_map'
+
+print(f'\nแถวหลังกรองเฉพาะ urban rail: {len(rail_df):,}')
+print('สายที่เหลือ:', sorted(rail_df['line'].unique()))
+
+# %% [markdown]
+# ### 3.2 Pivot จาก Long Format เป็น Wide Format
+# แกน index = `date` | คอลัมน์ = สาย | ค่า = ปริมาณผู้โดยสาร
+# ใช้ `aggfunc='sum'` เพื่อรองรับกรณีที่มีหลายแถวต่อวันต่อสาย
+
+# %%
+# ตรวจสอบ duplicate (date + line) ก่อน pivot — แสดงให้เห็น data quality ก่อน aggregate
+dup_rail = rail_df.duplicated(subset=['date', 'line'], keep=False)
+print(f'แถวที่ซ้ำ (date + line) ก่อน pivot: {dup_rail.sum():,}')
+if dup_rail.sum() > 0:
+    print('ตัวอย่าง (pivot_table จะ sum ค่าเหล่านี้เข้าด้วยกัน):')
+    print(rail_df[dup_rail][['date', 'line', 'ปริมาณ']].head())
+
+# %%
+# เรียงลำดับตามวันที่ก่อน pivot เพื่อให้ pipeline ชัดเจนและ deterministic
+rail_df = rail_df.sort_values('date').reset_index(drop=True)
+
+# pivot_table พร้อม aggfunc='sum' รองรับกรณีมีหลายแถวต่อวันต่อสาย
+pivot_df = rail_df.pivot_table(
+    index='date',
+    columns='line',
+    values='ปริมาณ',
+    aggfunc='sum',
+)
+pivot_df.columns.name = None  # ลบ label "line" ออกจาก column axis
+
+# เรียงลำดับคอลัมน์ให้ deterministic ทุกครั้งที่รัน
+pivot_df = pivot_df.sort_index(axis=1)
+
+print(f'รูปแบบหลัง pivot: {pivot_df.shape}  (แถว=วัน, คอลัมน์=สาย)')
+print('คอลัมน์:', pivot_df.columns.tolist())
+
+# %%
+# ตรวจสอบ missing values ก่อน fill — แสดง pattern ก่อนแก้ไข
+print('Missing values ต่อสายก่อน fill:')
+print(pivot_df.isna().sum().sort_values(ascending=False))
+
+# %% [markdown]
+# ### 3.3 เติมวันที่ที่หายไป (Handle Missing Dates)
+# Prophet ต้องการ time series ที่ต่อเนื่องทุกวัน — ห้ามมี gap
+#
+# กลยุทธ์การเติมข้อมูล:
+# | สถานการณ์ | กลยุทธ์ |
+# |---|---|
+# | ข้อมูลขาดหาย ≤3 วัน (บันทึกไม่ครบ) | `interpolate(method='time', limit_area='inside')` |
+# | ข้อมูลขาดหายนานกว่านั้น (หยุดให้บริการ) | `fillna(0)` |
+
+# %%
+# ตรวจสอบก่อนว่า index เป็น datetime — asfreq() ต้องการ DatetimeIndex เท่านั้น
+assert pd.api.types.is_datetime64_any_dtype(pivot_df.index), \
+    'pivot_df index ไม่ใช่ DatetimeIndex — ตรวจสอบขั้นตอน date conversion'
+
+# เรียงลำดับ index ก่อน reindex เพื่อความปลอดภัย
+pivot_df = pivot_df.sort_index()
+
+# reindex ให้ครบทุกวัน — วันที่ขาดหายจะกลายเป็น NaN
+pivot_df = pivot_df.asfreq('D')
+print(f'รูปแบบหลัง reindex: {pivot_df.shape}')
+
+# %%
+# interpolate ช่องว่างสั้น ≤3 วัน (data recording gap)
+# limit_area='inside' ป้องกันการ fill ที่ปลาย series
+# (เช่น NaN NaN 200 → ไม่ fill ด้านหน้า แต่ 100 NaN 200 → fill ตรงกลาง)
+pivot_df = pivot_df.interpolate(
+    method='time',
+    limit=3,
+    limit_area='inside',
+)
+
+# zero-fill ช่องว่างที่เหลือ (>3 วัน หรือปลาย series = หยุดให้บริการ)
+pivot_df = pivot_df.fillna(0)
+
+print(f'NaN หลัง fill ทั้งหมด: {pivot_df.isna().sum().sum()}  (ควรเป็น 0 ✅)')
+
+# %% [markdown]
+# ### 3.4 ตรวจสอบความสมบูรณ์ของช่วงวันที่ (Date Range Integrity Check)
+# ยืนยัน index เรียงต่อเนื่องและไม่มี gap ก่อนส่งต่อ Phase 4–8
+
+# %%
+assert pivot_df.index.is_monotonic_increasing, 'Date index ไม่ได้เรียงลำดับ!'
+
+expected_range = pd.date_range(
+    start=pivot_df.index.min(),
+    end=pivot_df.index.max(),
+    freq='D',
+)
+missing_dates = expected_range.difference(pivot_df.index)
+
+if len(missing_dates) == 0:
+    print(f'✅ Date range สมบูรณ์: {pivot_df.index.min().date()} → {pivot_df.index.max().date()}')
+    print(f'   จำนวนวันทั้งหมด: {len(pivot_df):,} วัน')
+else:
+    print(f'⚠️ พบวันที่หายไป {len(missing_dates)} วัน:', missing_dates.tolist())
+
+# %% [markdown]
+# ### 3.5 Feature Engineering
+# เพิ่ม time features สำหรับ EDA, Event Detection และ Prophet regressors
+
+# %%
+# เพิ่ม time features
+pivot_df['year']  = pivot_df.index.year
+pivot_df['month'] = pivot_df.index.month
+
+# day_of_week เป็น Categorical (ordered) เพื่อให้ plot/groupby เรียงลำดับถูกต้องเสมอ
+pivot_df['day_of_week'] = pd.Categorical(
+    pivot_df.index.day_name(),
+    categories=['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'],
+    ordered=True,
+)
+
+# dow เป็นตัวเลข 0–6 (0=Monday) — สะดวกสำหรับ model ที่รับเฉพาะ numeric input
+pivot_df['dow'] = pivot_df.index.weekday
+
+# is_weekend เป็น int (0/1) — Prophet และ ML model ชอบ numeric มากกว่า bool
+pivot_df['is_weekend'] = (pivot_df.index.weekday >= 5).astype(int)
+
+# %%
+# กำหนดรายชื่อสายรถไฟฟ้า (single authoritative list สำหรับ Phase 4–8 ทั้งหมด)
+rail_lines = [col for col in [
+    'BTS',
+    'MRT Blue', 'MRT Purple', 'MRT Yellow', 'MRT Pink',
+    'Airport Rail Link',
+    'SRT Red',
+] if col in pivot_df.columns]
+
+# ตรวจสอบว่ามีสายรถไฟฟ้าครบตามที่คาดหวัง
+assert len(rail_lines) >= 5, \
+    f'พบสายรถไฟฟ้าน้อยกว่าที่คาดไว้ ({len(rail_lines)} สาย) — ตรวจสอบ vehicle_map'
+
+# total_passengers รวมเฉพาะ rail lines แล้ว round เป็น int (ค่าหลัง interpolate อาจเป็น float)
+pivot_df['total_passengers'] = pivot_df[rail_lines].sum(axis=1).round().astype(int)
+
+print(f'rail_lines ที่ใช้วิเคราะห์ ({len(rail_lines)} สาย): {rail_lines}')
+print(f'คอลัมน์ทั้งหมดใน pivot_df: {pivot_df.columns.tolist()}')
+
+# %%
+# แสดงตัวอย่างข้อมูล 7 วันแรกหลัง transformation (1 สัปดาห์)
+pivot_df[rail_lines + ['total_passengers', 'year', 'month', 'day_of_week', 'is_weekend']].head(7)
