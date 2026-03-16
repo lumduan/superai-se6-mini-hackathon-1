@@ -139,10 +139,24 @@ We convert it into time-series wide format:
 
 | date | BTS | MRT Blue | MRT Purple | ARL | SRT Red |
 
-Using pivot:
+### Filter Before Pivot (prevent data leakage)
+
+Apply the rail filter **before** pivoting so no road/water/air rows contaminate the rail aggregates:
 
 ```python
-pivot_df = df.pivot_table(
+# Keep only public rail transport — must happen BEFORE pivot
+rail_df = df[
+    (df["รูปแบบการเดินทาง"] == "ทางราง") &
+    (df["สาธารณะ/ส่วนบุคคล"] == "สาธารณะ")
+].copy()
+
+print(f"Rail rows: {len(rail_df):,}  (original: {len(df):,})")
+```
+
+### Pivot to Wide Format
+
+```python
+pivot_df = rail_df.pivot_table(
     index="date",
     columns="ยานพาหนะ/ท่า",
     values="ปริมาณ",
@@ -182,6 +196,29 @@ Why this matters:
 - Prophet requires a **gapless** date sequence
 - Blindly zero-filling distorts trend and seasonality fitting
 - Interpolation preserves realistic ridership continuity
+
+### Date Range Integrity Check
+
+Verify the index is complete and monotonically increasing before proceeding:
+
+```python
+import pandas as pd
+
+# Assert index is sorted and has no gaps
+assert pivot_df.index.is_monotonic_increasing, "Date index is not sorted!"
+
+expected_range = pd.date_range(
+    start=pivot_df.index.min(),
+    end=pivot_df.index.max(),
+    freq="D"
+)
+missing_dates = expected_range.difference(pivot_df.index)
+
+if len(missing_dates) == 0:
+    print(f"✅ Date range complete: {pivot_df.index.min().date()} → {pivot_df.index.max().date()}")
+else:
+    print(f"⚠️ {len(missing_dates)} missing dates found:", missing_dates.tolist())
+```
 
 ---
 
@@ -442,6 +479,53 @@ What this reveals:
 
 ---
 
+## Calendar Heatmap
+
+Visualize ridership patterns across the entire date range as a calendar grid — immediately reveals holiday drops, weekly cycles, and seasonal peaks:
+
+```python
+import plotly.graph_objects as go
+import numpy as np
+
+cal_df = pivot_df[["total_passengers"]].copy()
+cal_df["week"] = cal_df.index.isocalendar().week.astype(int)
+cal_df["weekday"] = cal_df.index.weekday   # 0 = Monday
+cal_df["year_week"] = (
+    cal_df.index.year.astype(str) + "-W" +
+    cal_df["week"].astype(str).str.zfill(2)
+)
+
+pivot_cal = cal_df.pivot_table(
+    index="weekday",
+    columns="year_week",
+    values="total_passengers",
+    aggfunc="mean"
+)
+
+day_labels = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+
+fig = go.Figure(go.Heatmap(
+    z=pivot_cal.values,
+    x=pivot_cal.columns,
+    y=day_labels,
+    colorscale="YlOrRd",
+    colorbar=dict(title="Avg Passengers")
+))
+fig.update_layout(
+    title="Daily Ridership Calendar Heatmap (All Rail Lines)",
+    xaxis_title="Week",
+    yaxis_title="Day of Week"
+)
+fig.show()
+```
+
+What to look for:
+- **Horizontal dark bands on Saturday/Sunday** → weekend low demand ✅
+- **Vertical cold columns** → holiday weeks (Songkran, New Year)
+- **Bright vertical columns** → event-driven ridership surges
+
+---
+
 # Phase 6 — Event Detection
 
 ## Objective
@@ -658,6 +742,43 @@ Prophet will automatically show:
 
 ---
 
+## Extra Regressors
+
+Improve forecast accuracy by adding known external features as regressors. Prophet treats these as additional linear terms alongside the decomposition:
+
+```python
+# Prepare regressor columns on the prophet_df
+prophet_df["is_weekend"] = prophet_df["ds"].dt.weekday >= 5
+prophet_df["month"] = prophet_df["ds"].dt.month
+
+# Then declare them in the model BEFORE fitting
+model = Prophet(
+    yearly_seasonality=True,
+    weekly_seasonality=True,
+    daily_seasonality=False,
+    seasonality_mode="multiplicative",
+    changepoint_prior_scale=0.05,
+    holidays=holidays
+)
+model.add_regressor("is_weekend")
+model.add_regressor("month")
+
+model.fit(train)  # train must also contain these columns
+
+# Future dataframe must include regressor values too
+future = model.make_future_dataframe(periods=30)
+future["is_weekend"] = future["ds"].dt.weekday >= 5
+future["month"] = future["ds"].dt.month
+
+forecast = model.predict(future)
+```
+
+Why regressors help:
+- `is_weekend` captures the sharp Mon→Fri vs Sat/Sun demand cliff not fully covered by weekly seasonality alone
+- `month` captures subtle intra-year variation (school terms, rainy season, etc.)
+
+---
+
 ## Per-Line Forecasting
 
 Instead of forecasting only `total_passengers`, forecast each rail line separately for richer insights:
@@ -745,6 +866,46 @@ print(comparison)
 ```
 
 Expected result: Prophet MAE < Naive MAE, confirming the model adds value beyond a trivial baseline.
+
+## Prophet Cross-Validation
+
+Prophet's built-in `cross_validation` performs **rolling window evaluation** across the full training period — much more robust than a single train/test split:
+
+```python
+from prophet.diagnostics import cross_validation, performance_metrics
+
+# initial: size of first training window
+# period:  spacing between each cut-off
+# horizon: forecast window to evaluate
+cv_results = cross_validation(
+    model,
+    initial="300 days",
+    period="30 days",
+    horizon="30 days",
+    parallel="processes"  # speed up with multiprocessing
+)
+
+print(cv_results.head())
+
+# Built-in metric aggregation
+df_p = performance_metrics(cv_results)
+print(df_p[["horizon", "mae", "rmse", "mape"]].tail(10))
+```
+
+Visualize how error grows with forecast horizon:
+
+```python
+from prophet.plot import plot_cross_validation_metric
+
+fig = plot_cross_validation_metric(cv_results, metric="mape")
+fig.suptitle("MAPE vs Forecast Horizon (Cross-Validation)")
+fig.show()
+```
+
+Why cross-validation beats a single split:
+- Multiple cut-offs reduce sensitivity to the specific 30 days chosen
+- Shows whether forecast accuracy degrades as the horizon grows
+- Judges recognize this as production-grade evaluation practice
 
 ## Visualization
 
@@ -835,22 +996,47 @@ Weekday ridership is significantly higher than weekends for BTS and MRT, confirm
 **Insight 8**  
 Ridership correlation between BTS and MRT Blue is high, suggesting shared demand drivers across interconnected lines.
 
+**Insight 9 — Network Interaction**  
+High BTS ↔ MRT Blue correlation (> 0.85) indicates passenger transfer behaviour: demand shocks (holidays, events) propagate across both lines simultaneously, implying integrated capacity planning is needed.
+
+**Insight 10 — Ridership Elasticity**  
+Songkran causes approximately X% drop in total rail ridership over the 3-day core period. This elasticity figure can guide service frequency reductions and staff scheduling during major holidays.
+
+**Insight 11 — Commuter Intensity**  
+Weekday ridership is on average Y× higher than weekend ridership across BTS and MRT. ARL shows a flatter weekday/weekend ratio, reflecting a mix of commuter and tourist demand.
+
+*(Replace X and Y with actual values computed during analysis.)*
+
 ---
 
 # Notebook Structure
 
 Final notebook structure:
 
-1. Introduction
-2. Load Dataset
+1. Introduction & Dataset Overview
+2. Data Loading
 3. Data Cleaning & Validation
 4. Data Transformation
-5. Modal Share Analysis
-6. Urban Rail Comparison + Seasonality + Correlation
-7. Event Detection
-8. Prophet Forecast
-9. Model Evaluation & Residual Analysis
-10. Key Insights
+5. Exploratory Analysis
+   - Modal share
+   - Ridership trend
+   - Weekday patterns
+   - Calendar heatmap
+6. Event Detection
+   - Anomaly detection
+   - Holiday mapping
+7. Forecasting
+   - Prophet model
+   - Extra regressors
+   - Per-line forecasting
+8. Model Evaluation
+   - MAE / RMSE / MAPE
+   - Baseline comparison
+   - Cross-validation
+9. Model Diagnostics
+   - Residual analysis
+   - Prophet components
+10. Insights & Conclusion
 
 ---
 
@@ -864,17 +1050,19 @@ Final notebook structure:
 4. Ridership Trend (Multi-line)
 5. Rail Line Comparison
 6. Rolling Trend Chart
-7. Anomaly Detection Plot (with highlighted anomaly points)
-8. Weekday Ridership Bar Chart
-9. Rolling 30-Day YoY Growth Line Chart
-10. Ridership Correlation Heatmap
-11. Ridership Distribution Box Plot
-12. Forecast Plot (total + per line)
-13. Forecast vs Actual Evaluation Plot
-14. Prophet Components Plot (trend + seasonality)
-15. Residual Distribution + Residual Over Time
+7. Calendar Heatmap (daily ridership grid)
+8. Anomaly Detection Plot (with highlighted anomaly points)
+9. Weekday Ridership Bar Chart
+10. Rolling 30-Day YoY Growth Line Chart
+11. Ridership Correlation Heatmap
+12. Ridership Distribution Box Plot
+13. Forecast Plot (total + per line)
+14. Forecast vs Actual Evaluation Plot
+15. Cross-Validation MAPE vs Horizon Plot
+16. Prophet Components Plot (trend + seasonality)
+17. Residual Distribution + Residual Over Time
 
-**Total:** 14–16 visualizations
+**Total:** 16–18 visualizations
 
 ---
 
