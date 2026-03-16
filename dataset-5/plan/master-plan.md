@@ -251,11 +251,23 @@ Formula:
 $$\text{YoY Growth} = \frac{\text{passengers}_{2026} - \text{passengers}_{2025}}{\text{passengers}_{2025}} \times 100\%$$
 
 ```python
+# Define modal columns mapping to pivot_df column names
+modal_cols = {
+    "BTS": ["BTS"],
+    "MRT": ["MRT Blue", "MRT Purple", "MRT Yellow", "MRT Pink"],
+    "ARL": ["Airport Rail Link"],
+    "SRT": ["SRT Red"],
+}
+
 pivot_df["year"] = pivot_df.index.year
 
-yearly = pivot_df.groupby("year")[modal_cols].sum()
+# Aggregate each mode across its lines
+yearly_modal = pd.DataFrame({
+    mode: pivot_df.groupby("year")[cols].sum().sum(axis=1)
+    for mode, cols in modal_cols.items()
+})
 
-growth = ((yearly.loc[2026] - yearly.loc[2025]) / yearly.loc[2025]) * 100
+growth = ((yearly_modal.loc[2026] - yearly_modal.loc[2025]) / yearly_modal.loc[2025]) * 100
 growth_df = growth.reset_index()
 growth_df.columns = ["mode", "yoy_growth_pct"]
 
@@ -405,6 +417,31 @@ Interpretation:
 
 ---
 
+## Ridership Distribution
+
+Visualize the spread, median, and outliers of each line to understand typical operating ranges:
+
+```python
+import plotly.express as px
+
+fig = px.box(
+    pivot_df[rail_lines].melt(var_name="Line", value_name="Passengers"),
+    x="Line",
+    y="Passengers",
+    color="Line",
+    title="Daily Ridership Distribution by Rail Line",
+    labels={"Passengers": "Daily Passengers"}
+)
+fig.show()
+```
+
+What this reveals:
+- **Median** → typical daily ridership baseline
+- **Box width (IQR)** → day-to-day variability
+- **Whiskers / outlier dots** → event-driven spikes or holiday troughs
+
+---
+
 # Phase 6 — Event Detection
 
 ## Objective
@@ -415,10 +452,13 @@ Detect unusual passenger patterns.
 
 ## Total Passenger Trend
 
-Compute total ridership:
+Compute total ridership (sum **only rail line columns** to avoid including feature columns like `year`, `month`, `is_weekend`):
 
 ```python
-pivot_df["total_passengers"] = pivot_df.sum(axis=1)
+rail_lines = ["BTS", "MRT Blue", "MRT Purple", "MRT Yellow", "MRT Pink",
+              "Airport Rail Link", "SRT Red"]
+
+pivot_df["total_passengers"] = pivot_df[rail_lines].sum(axis=1)
 ```
 
 ---
@@ -542,20 +582,29 @@ Use explicit parameters instead of defaults for better control:
 from prophet import Prophet
 import pandas as pd
 
-# --- Holiday Calendar ---
+# --- Holiday Calendar (past + future — REQUIRED for Prophet to forecast correctly) ---
+# Prophet must know about holidays in both the training period AND the forecast window.
+# If a 2026/2027 holiday is missing, Prophet will not apply the holiday effect to the forecast.
 holidays = pd.DataFrame({
     "holiday": [
-        "songkran", "songkran", "songkran",
-        "new_year", "new_year",
-        "long_weekend"
+        # Songkran (Thai New Year) — 3-day core period each year
+        "songkran", "songkran", "songkran",  # 2025
+        "songkran", "songkran", "songkran",  # 2026
+        "songkran", "songkran", "songkran",  # 2027
+        # New Year's Day
+        "new_year", "new_year", "new_year",  # 2025, 2026, 2027
+        # Long weekends / public holidays
+        "long_weekend", "long_weekend", "long_weekend",
     ],
     "ds": pd.to_datetime([
         "2025-04-13", "2025-04-14", "2025-04-15",
-        "2025-01-01", "2026-01-01",
-        "2025-12-05"
+        "2026-04-13", "2026-04-14", "2026-04-15",
+        "2027-04-13", "2027-04-14", "2027-04-15",
+        "2025-01-01", "2026-01-01", "2027-01-01",
+        "2025-12-05", "2025-12-10", "2026-12-05",
     ]),
-    "lower_window": [-1, -1, -1, -1, -1, 0],
-    "upper_window": [ 1,  1,  1,  1,  1, 1],
+    "lower_window": [-1]*15,
+    "upper_window": [ 1]*15,
 })
 
 model = Prophet(
@@ -674,6 +723,28 @@ print(f"MAE:  {mae:,.0f} passengers")
 print(f"RMSE: {rmse:,.0f} passengers")
 print(f"MAPE: {mape:.2f}%")
 ```
+
+## Baseline Comparison (Naive Forecast)
+
+A model is only useful if it **beats a simple baseline**. The naive forecast assumes tomorrow = today (i.e., no change).
+
+```python
+# Naive forecast: shift actual values by 1 day
+naive_pred = eval_df["y"].shift(1).dropna().values
+actual_trimmed = eval_df["y"].iloc[1:].values
+
+nai_mae  = mean_absolute_error(actual_trimmed, naive_pred)
+nai_mape = np.mean(np.abs((actual_trimmed - naive_pred) / actual_trimmed)) * 100
+
+comparison = pd.DataFrame({
+    "Model": ["Naive (yesterday = today)", "Prophet"],
+    "MAE":   [nai_mae, mae],
+    "MAPE":  [nai_mape, mape]
+})
+print(comparison)
+```
+
+Expected result: Prophet MAE < Naive MAE, confirming the model adds value beyond a trivial baseline.
 
 ## Visualization
 
@@ -797,12 +868,13 @@ Final notebook structure:
 8. Weekday Ridership Bar Chart
 9. Rolling 30-Day YoY Growth Line Chart
 10. Ridership Correlation Heatmap
-11. Forecast Plot (total + per line)
-12. Forecast vs Actual Evaluation Plot
-13. Prophet Components Plot (trend + seasonality)
-14. Residual Distribution + Residual Over Time
+11. Ridership Distribution Box Plot
+12. Forecast Plot (total + per line)
+13. Forecast vs Actual Evaluation Plot
+14. Prophet Components Plot (trend + seasonality)
+15. Residual Distribution + Residual Over Time
 
-**Total:** 13–15 visualizations
+**Total:** 14–16 visualizations
 
 ---
 
