@@ -1604,7 +1604,6 @@ boxday_df = pivot_df[['total_passengers', 'anomaly_type']].copy()
 boxday_df['day_of_week'] = boxday_df.index.day_name()
 
 fig = px.box(
-    boxday_df.replace(0, np.nan),
     x='day_of_week',
     y='total_passengers',
     color='day_of_week',
@@ -1671,3 +1670,351 @@ if len(anomaly_df) > 0:
     wd_we_anomaly = anomaly_df.groupby('is_weekend')['anomaly_type'].value_counts().unstack(fill_value=0)
     wd_we_anomaly.index = wd_we_anomaly.index.map({False: 'Weekday', True: 'Weekend'})
     print(wd_we_anomaly.to_string())
+
+# %% [markdown]
+# ---
+# ## Phase 7 — พยากรณ์ผู้โดยสาร (Passenger Forecasting with Facebook Prophet)
+#
+# Facebook Prophet เป็นโมเดล time-series forecasting ที่พัฒนาโดย Meta
+# สูตร: y(t) = g(t) + s(t) + h(t) + ε_t
+#   g(t) = trend (piecewise linear)
+#   s(t) = seasonality (weekly + yearly via Fourier series)
+#   h(t) = holiday effects
+#   ε_t  = noise
+#
+# ทำไม Prophet เหมาะกับชุดข้อมูลนี้:
+# - weekly seasonality ชัดเจน (weekday >> weekend)
+# - yearly seasonality (สงกรานต์, ปีใหม่)
+# - วันหยุดส่งผลต่อ ridership อย่างมีนัย
+#
+# การวิเคราะห์ใน Phase นี้:
+# 1.  เตรียมข้อมูล (regressors ก่อน split เสมอ)
+# 2.  Train/Test Split (30 วันสุดท้าย)
+# 3.  Holiday Calendar (ครอบคลุม 2025–2027)
+# 4.  Train Prophet + Extra Regressors (is_weekend, month sin/cos)
+# 5.  Future Dataframe + Forecast
+# 6.  Forecast Visualization (Plotly + 80% CI)
+# 7.  Prophet Components Plot
+# 8.  Per-Line Forecasting
+# 9.  Summary
+
+# %% [markdown]
+# ### 7.1 เตรียมข้อมูลสำหรับ Prophet
+
+# %%
+# เตรียม prophet_df จาก pivot_df
+prophet_df = pivot_df.reset_index()[['date', 'total_passengers']].copy()
+prophet_df.columns = ['ds', 'y']
+
+# ใช้ notna() + clip แทนการ filter y>0 — รักษา continuity ของ time series
+# Prophet รับ 0 ได้ และ y=0 อาจเป็นข้อมูลจริง (shutdown, strike)
+prophet_df = prophet_df[prophet_df['y'].notna()].copy()
+prophet_df['y'] = prophet_df['y'].clip(lower=0)
+
+# สำคัญ: เพิ่ม regressors ก่อน split — train/test/future ต้องมีคอลัมน์ครบ
+# is_weekend: จับ sharp weekday/weekend cliff
+# month_sin/cos: circular encoding → Dec ≈ Jan (ไม่ใช่ linear month=1..12)
+prophet_df['is_weekend'] = (prophet_df['ds'].dt.weekday >= 5).astype(int)
+prophet_df['month_sin']  = np.sin(2 * np.pi * prophet_df['ds'].dt.month / 12)
+prophet_df['month_cos']  = np.cos(2 * np.pi * prophet_df['ds'].dt.month / 12)
+
+print(f'Prophet dataset: {len(prophet_df)} วัน')
+print(f'ช่วงวันที่: {prophet_df["ds"].min().date()} → {prophet_df["ds"].max().date()}')
+print(prophet_df.tail(5))
+
+# %% [markdown]
+# ### 7.2 Train/Test Split
+
+# %%
+TEST_DAYS     = 30   # hold-out set สำหรับ evaluate
+FORECAST_DAYS = 30   # จำนวนวันพยากรณ์ออกไปอนาคต
+
+# Split หลังเพิ่ม regressors → ทั้ง train/test มีคอลัมน์ครบ
+train = prophet_df.iloc[:-TEST_DAYS].copy()
+test  = prophet_df.iloc[-TEST_DAYS:].copy()
+
+print(f'Train: {len(train)} วัน  ({train["ds"].min().date()} → {train["ds"].max().date()})')
+print(f'Test:  {len(test)} วัน   ({test["ds"].min().date()} → {test["ds"].max().date()})')
+
+# %% [markdown]
+# ### 7.3 ปฏิทินวันหยุดไทย — ครอบคลุม 2025–2027
+#
+# Prophet ต้องรู้จักวันหยุดใน forecast window ด้วย
+# ถ้าใส่แค่ 2025 Prophet จะไม่ apply holiday effect สำหรับการพยากรณ์ปี 2026
+
+# %%
+# วันหยุดสำคัญ 3 ปี (2025–2027) ครอบคลุมทั้ง training และ forecast period
+_h = lambda name, dates, lw, uw, ps=10: pd.DataFrame({
+    'holiday':      [name] * len(dates),
+    'ds':           pd.to_datetime(dates),
+    'lower_window': [lw]   * len(dates),
+    'upper_window': [uw]   * len(dates),
+    'prior_scale':  [ps]   * len(dates),
+})
+
+holidays_prophet = pd.concat([
+    # สงกรานต์ — prior_scale=15 (ผลกระทบสูง), window [-3,+3] (ยาวกว่าวันอื่น)
+    _h('songkran', ['2025-04-13','2025-04-14','2025-04-15',
+                    '2026-04-13','2026-04-14','2026-04-15',
+                    '2027-04-13','2027-04-14','2027-04-15'], -3, 3, 15),
+    # ปีใหม่
+    _h('new_year', ['2025-01-01','2026-01-01','2027-01-01'], -1, 1),
+    # วันแรงงาน
+    _h('labor_day', ['2025-05-01','2026-05-01','2027-05-01'], -1, 1),
+    # วันชาติ (5 ธ.ค.)
+    _h('national_day', ['2025-12-05','2026-12-05','2027-12-05'], -1, 1),
+    # วันรัฐธรรมนูญ (10 ธ.ค.)
+    _h('constitution_day', ['2025-12-10','2026-12-10','2027-12-10'], -1, 1),
+    # วันฉัตรมงคล (4 พ.ค.)
+    _h('coronation_day', ['2025-05-05','2026-05-04','2027-05-05'], -1, 1),
+    # วิสาขบูชา
+    _h('visakha_bucha', ['2025-05-12','2026-05-01','2027-05-20'], -1, 1),
+    # อาสาฬหบูชา
+    _h('asanha_bucha', ['2025-07-10','2026-06-29','2027-07-18'], -1, 1),
+    # วันเฉลิมพระชนมพรรษา ร.10 (28 ก.ค.)
+    _h('king_bday', ['2025-07-28','2026-07-28','2027-07-28'], -1, 1),
+    # วันแม่แห่งชาติ (12 ส.ค.)
+    _h('mother_day', ['2025-08-12','2026-08-12','2027-08-12'], -1, 1),
+    # วันหยุดยาว (Long Weekends)
+    _h('long_weekend', ['2025-02-12','2025-05-02','2025-05-06','2025-07-29'], -1, 1),
+], ignore_index=True)
+
+print(f'Holiday calendar: {len(holidays_prophet)} entries, {holidays_prophet["holiday"].nunique()} unique events')
+print(holidays_prophet['holiday'].value_counts().to_string())
+
+# %% [markdown]
+# ### 7.4 Train Prophet Model พร้อม Extra Regressors
+#
+# - seasonality_mode='multiplicative': variance สเกลตาม trend
+# - changepoint_prior_scale=0.05: smooth trend (tune ถ้ามี structural break)
+# - interval_width=0.8: 80% CI (ระบุชัดเจนแทนที่จะใช้ default)
+
+# %%
+model = Prophet(
+    yearly_seasonality=True,
+    weekly_seasonality=True,
+    daily_seasonality=False,
+    seasonality_mode='multiplicative',
+    changepoint_prior_scale=0.05,
+    interval_width=0.8,
+    holidays=holidays_prophet,
+)
+
+# Extra regressors — ต้อง add ก่อน fit เสมอ
+model.add_regressor('is_weekend')
+model.add_regressor('month_sin')
+model.add_regressor('month_cos')
+
+model.fit(train)
+print('✅ Prophet model trained successfully')
+print(f'   Training samples: {len(train)}')
+print(f'   Changepoints detected: {len(model.changepoints)}')
+
+# %% [markdown]
+# ### 7.5 สร้าง Future Dataframe + Forecast
+
+# %%
+future = model.make_future_dataframe(periods=FORECAST_DAYS)
+
+# เพิ่ม regressors ใน future — ต้องครบทุก regressor ที่ใช้ตอน fit
+future['is_weekend'] = (future['ds'].dt.weekday >= 5).astype(int)
+future['month_sin']  = np.sin(2 * np.pi * future['ds'].dt.month / 12)
+future['month_cos']  = np.cos(2 * np.pi * future['ds'].dt.month / 12)
+
+forecast = model.predict(future)
+
+print(f'Forecast: training ({len(train)}) + future ({FORECAST_DAYS}) = {len(forecast)} rows')
+print(f'\nการพยากรณ์ {FORECAST_DAYS} วันข้างหน้า:')
+print(forecast.tail(FORECAST_DAYS)[['ds','yhat','yhat_lower','yhat_upper']].to_string(index=False))
+
+# %% [markdown]
+# ### 7.6 Forecast Visualization — Plotly Interactive (80% CI)
+
+# %%
+# ใช้ date filter แทน iloc เพื่อป้องกัน bug กรณีมี missing dates
+_train_end   = train['ds'].max()
+_fitted      = forecast[forecast['ds'] <= _train_end]
+_fc_period   = forecast[forecast['ds'] > _train_end]
+
+fig = go.Figure()
+
+# Historical actual
+fig.add_trace(go.Scatter(
+    x=prophet_df['ds'], y=prophet_df['y'],
+    name='Actual (Historical)',
+    line=dict(color='steelblue', width=1.5), opacity=0.8,
+))
+
+# Fitted (training)
+fig.add_trace(go.Scatter(
+    x=_fitted['ds'], y=_fitted['yhat'],
+    name='Fitted (Train)',
+    line=dict(color='orange', width=1, dash='dot'), opacity=0.7,
+))
+
+# 80% CI ของ forecast
+fig.add_trace(go.Scatter(
+    x=pd.concat([_fc_period['ds'], _fc_period['ds'][::-1]]),
+    y=pd.concat([_fc_period['yhat_upper'], _fc_period['yhat_lower'][::-1]]),
+    fill='toself',
+    fillcolor='rgba(255,100,100,0.15)',
+    line=dict(color='rgba(0,0,0,0)'),
+    name='80% Confidence Interval',
+))
+
+# Forecast line
+fig.add_trace(go.Scatter(
+    x=_fc_period['ds'], y=_fc_period['yhat'],
+    name=f'Forecast ({FORECAST_DAYS} days)',
+    line=dict(color='tomato', width=2.5),
+))
+
+fig.add_vline(x=_train_end, line_dash='dash', line_color='gray',
+              annotation_text='Train | Forecast', annotation_position='top right')
+fig.update_layout(
+    title='การพยากรณ์ผู้โดยสาร 30 วัน ด้วย Prophet — 80% CI',
+    xaxis_title='วันที่', yaxis_title='ผู้โดยสาร (คน)',
+    hovermode='x unified',
+)
+fig.show()
+
+# %% [markdown]
+# ### 7.7 Prophet Components Plot
+#
+# Decomposition: Trend + Weekly + Yearly Seasonality + Holiday Effects
+
+# %%
+fig_comp = model.plot_components(forecast)
+fig_comp.suptitle('Prophet Components: Trend + Seasonality + Holiday Effects', y=1.02)
+fig_comp.tight_layout()
+
+# %% [markdown]
+# ### 7.8 Per-Line Forecasting — พยากรณ์แยกตามสายรถไฟฟ้า
+#
+# Forecast แต่ละสายแยกกัน — แสดง granular demand insights
+
+# %%
+forecast_lines = [l for l in ['BTS','MRT Blue','MRT Purple','Airport Rail Link','SRT Red']
+                  if l in rail_lines]
+
+line_forecasts = {}   # เก็บผลลัพธ์สำหรับ Phase 8
+
+for line in forecast_lines:
+    # เตรียม line_df — notna() + clip (รักษา continuity)
+    line_df = pivot_df[[line]].reset_index().copy()
+    line_df.columns = ['ds', 'y']
+    line_df = line_df[line_df['y'].notna()].copy()
+    line_df['y'] = line_df['y'].clip(lower=0)
+
+    # เพิ่ม regressors ก่อน split
+    line_df['is_weekend'] = (line_df['ds'].dt.weekday >= 5).astype(int)
+    line_df['month_sin']  = np.sin(2 * np.pi * line_df['ds'].dt.month / 12)
+    line_df['month_cos']  = np.cos(2 * np.pi * line_df['ds'].dt.month / 12)
+
+    l_train = line_df.iloc[:-TEST_DAYS].copy()
+    l_test  = line_df.iloc[-TEST_DAYS:].copy()
+
+    m = Prophet(
+        yearly_seasonality=True,
+        weekly_seasonality=True,
+        daily_seasonality=False,
+        seasonality_mode='multiplicative',
+        changepoint_prior_scale=0.05,
+        interval_width=0.8,
+        holidays=holidays_prophet,
+    )
+    m.add_regressor('is_weekend')
+    m.add_regressor('month_sin')
+    m.add_regressor('month_cos')
+    m.fit(l_train)
+
+    future_line = m.make_future_dataframe(periods=FORECAST_DAYS)
+    future_line['is_weekend'] = (future_line['ds'].dt.weekday >= 5).astype(int)
+    future_line['month_sin']  = np.sin(2 * np.pi * future_line['ds'].dt.month / 12)
+    future_line['month_cos']  = np.cos(2 * np.pi * future_line['ds'].dt.month / 12)
+    fc = m.predict(future_line)
+
+    line_forecasts[line] = {'model': m, 'forecast': fc, 'test': l_test, 'train': l_train}
+    print(f'✅ {line:<22}: avg forecast = {fc[fc["ds"] > l_train["ds"].max()]["yhat"].mean():>10,.0f} คน/วัน')
+
+# %% [markdown]
+# ### 7.9 Per-Line Forecast Visualization
+
+# %%
+fig = go.Figure()
+_colors = px.colors.qualitative.Plotly
+
+for i, line in enumerate(forecast_lines):
+    fc    = line_forecasts[line]['forecast']
+    ldf   = line_forecasts[line]['train']
+    _c    = _colors[i % len(_colors)]
+    _lend = ldf['ds'].max()
+    _fc_l = fc[fc['ds'] > _lend]
+
+    # Actual (แสดง 90 วันล่าสุดเพื่อให้กราฟไม่แน่น)
+    fig.add_trace(go.Scatter(
+        x=ldf['ds'].tail(90), y=ldf['y'].tail(90),
+        name=f'{line} (Actual)',
+        line=dict(color=_c, width=1), opacity=0.5,
+        legendgroup=line,
+    ))
+
+    # CI ribbon
+    try:
+        r, g, b = int(_c[1:3],16), int(_c[3:5],16), int(_c[5:7],16)
+        fill_color = f'rgba({r},{g},{b},0.1)'
+    except Exception:
+        fill_color = 'rgba(100,100,200,0.1)'
+
+    fig.add_trace(go.Scatter(
+        x=pd.concat([_fc_l['ds'], _fc_l['ds'][::-1]]),
+        y=pd.concat([_fc_l['yhat_upper'], _fc_l['yhat_lower'][::-1]]),
+        fill='toself', fillcolor=fill_color,
+        line=dict(color='rgba(0,0,0,0)'),
+        showlegend=False, legendgroup=line,
+    ))
+
+    # Forecast line
+    fig.add_trace(go.Scatter(
+        x=_fc_l['ds'], y=_fc_l['yhat'],
+        name=f'{line} (Forecast)',
+        line=dict(color=_c, width=2.5, dash='dash'),
+        legendgroup=line,
+    ))
+
+fig.add_vline(x=train['ds'].max(), line_dash='dash', line_color='gray',
+              annotation_text='Forecast start')
+fig.update_layout(
+    title='การพยากรณ์ผู้โดยสารแยกตามสายรถไฟฟ้า (Per-Line Forecast)',
+    xaxis_title='วันที่', yaxis_title='ผู้โดยสาร (คน)',
+    hovermode='x unified',
+)
+fig.show()
+
+# %% [markdown]
+# ### 7.10 สรุปการพยากรณ์ Phase 7
+
+# %%
+# สรุปตัวเลขสำหรับ Phase 8 (Evaluation) และ Phase 9 (Insights)
+_fc_future   = forecast[forecast['ds'] > train['ds'].max()]
+avg_forecast = _fc_future['yhat'].mean()
+min_forecast = _fc_future['yhat'].min()
+max_forecast = _fc_future['yhat'].max()
+trend_30d    = (_fc_future['yhat'].iloc[-1] - _fc_future['yhat'].iloc[0]) / _fc_future['yhat'].iloc[0] * 100 \
+               if len(_fc_future) > 0 else float('nan')
+
+print('=== Forecast Summary — Total Passengers (Next 30 Days) ===')
+print(f'ค่าเฉลี่ย yhat:    {avg_forecast:,.0f} คน/วัน')
+print(f'ต่ำสุด yhat:       {min_forecast:,.0f} คน/วัน')
+print(f'สูงสุด yhat:       {max_forecast:,.0f} คน/วัน')
+print(f'Trend 30 วัน:      {trend_30d:+.1f}%')
+print()
+
+print('=== Per-Line Forecast vs Last 90-Day Average ===')
+for line in forecast_lines:
+    _lfc   = line_forecasts[line]
+    _lend  = _lfc['train']['ds'].max()
+    fc_avg = _lfc['forecast'][_lfc['forecast']['ds'] > _lend]['yhat'].mean()
+    act90  = _lfc['train']['y'].tail(90).mean()
+    chg    = (fc_avg - act90) / act90 * 100 if act90 > 0 else float('nan')
+    print(f'  {line:<22}: forecast {fc_avg:>10,.0f}  vs actual {act90:>10,.0f}  ({chg:+.1f}%)')
