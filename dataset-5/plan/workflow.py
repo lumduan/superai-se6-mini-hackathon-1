@@ -1182,12 +1182,12 @@ print(f'คู่สายที่มีความสัมพันธ์ส
 # | เหตุการณ์พิเศษ | ผู้โดยสารพุ่งสูง |
 
 # %% [markdown]
-# ### 6.1 Total Passenger Trend + 7-Day Rolling Average
+# ### 6.1 Total Passenger Trend + 7-Day Rolling Average (center=True)
 
 # %%
 # total_passengers คำนวณไว้แล้วใน Phase 3 (sum เฉพาะ rail_lines)
-# คำนวณ rolling_7 ใหม่ที่นี่เพื่อให้ Phase 6 self-contained
-pivot_df['rolling_7'] = pivot_df['total_passengers'].rolling(7).mean()
+# ใช้ center=True เพื่อให้ค่า smooth อยู่ตรงกลางหน้าต่าง ไม่ใช่ lagging average
+pivot_df['rolling_7'] = pivot_df['total_passengers'].rolling(7, center=True).mean()
 
 fig = go.Figure()
 fig.add_trace(go.Scatter(
@@ -1212,34 +1212,55 @@ fig.update_layout(
 fig.show()
 
 # %% [markdown]
-# ### 6.2 Z-Score Anomaly Detection
+# ### 6.2 Rolling Z-Score Anomaly Detection (window=30)
 #
-# สูตร: z = (x − μ) / σ
-# |z| > 3 → ถือว่าเป็น anomaly (ห่างจากค่าเฉลี่ยมากกว่า 3 เท่าของ SD)
+# สูตร: z = (x − rolling_mean) / rolling_std
+# ใช้ rolling window 30 วันแทน global mean เพื่อจัดการ trend ใน ridership
+# (ridership มี upward trend → global mean ทำให้ต้นปีดู anomaly ต่ำ, ปลายปีดู anomaly สูง)
 #
-# หมายเหตุ: ใช้ fillna(0) ก่อน zscore เพื่อป้องกัน NaN ทำให้ค่าสูญหาย
-# ตำแหน่งที่เป็น NaN จริงจะยังคงเป็น 0 (z ≈ 0) ไม่ถูกตีว่าเป็น anomaly
+# หมายเหตุ: ไม่ใช้ fillna(0) ก่อนคำนวณ เพราะ NaN → 0 ทำให้เกิด false drop anomaly
+# ใช้ nan_policy='omit' หรือ manual rolling แทน
 
 # %%
-# คำนวณ Z-score จาก total_passengers
-z_scores = stats.zscore(pivot_df['total_passengers'].fillna(0))
-pivot_df['z_score']    = z_scores
+# Rolling Z-score: เปรียบเทียบกับ local mean/std ใน 30 วันที่ผ่านมา
+# ใช้ shift(1) เพื่อไม่รวมค่าวันนี้เองในหน้าต่าง → z_today = (today - mean_past_30d)
+# ถ้าไม่ shift จะได้ z ที่ถูก dilute โดยตัวมันเอง ทำให้ anomaly ไม่ชัด
+_rolling_window = 30
+_roll_mean = pivot_df['total_passengers'].rolling(_rolling_window, min_periods=15).mean().shift(1)
+_roll_std  = pivot_df['total_passengers'].rolling(_rolling_window, min_periods=15).std().shift(1)
+
+# clip lower ป้องกัน std ≈ 0 ในช่วงที่ ridership คงที่มาก (ทำให้ z-score พุ่งเกินจริง)
+_std_floor = pivot_df['total_passengers'].std() * 0.1   # ขั้นต่ำ = 10% ของ global std
+_roll_std  = _roll_std.clip(lower=_std_floor)
+
+# คำนวณ z-score และ fallback เป็น global z ในช่วงที่ rolling ยังไม่มีข้อมูลพอ (ต้น series)
+pivot_df['z_score'] = (pivot_df['total_passengers'] - _roll_mean) / _roll_std
+
+global_z = (
+    (pivot_df['total_passengers'] - pivot_df['total_passengers'].mean())
+    / pivot_df['total_passengers'].std()
+)
+pivot_df['z_score'] = pivot_df['z_score'].fillna(global_z)
+
 pivot_df['is_anomaly'] = pivot_df['z_score'].abs() > 3
 
-# แยก anomaly เป็น spike (ผู้โดยสารสูงผิดปกติ) และ drop (ผู้โดยสารต่ำผิดปกติ)
+# แยก anomaly เป็น spike (พุ่งสูง) และ drop (ลดต่ำ)
 pivot_df['anomaly_type'] = 'normal'
 pivot_df.loc[pivot_df['z_score'] >  3, 'anomaly_type'] = 'spike'
 pivot_df.loc[pivot_df['z_score'] < -3, 'anomaly_type'] = 'drop'
 
+# is_weekend คำนวณไว้แล้วใน Phase 3 — reuse จาก pivot_df
 anomaly_df = pivot_df[pivot_df['is_anomaly']].copy()
 anomaly_df['day_of_week'] = anomaly_df.index.day_name()
 
 print(f'จำนวน Anomaly ที่พบ: {len(anomaly_df)} วัน')
 print(f'  → Spike (ผู้โดยสารสูงผิดปกติ): {(pivot_df["anomaly_type"] == "spike").sum()} วัน')
 print(f'  → Drop  (ผู้โดยสารต่ำผิดปกติ): {(pivot_df["anomaly_type"] == "drop").sum()} วัน')
+print(f'  → Weekday anomaly: {(~anomaly_df["is_weekend"]).sum()} วัน')
+print(f'  → Weekend anomaly: {anomaly_df["is_weekend"].sum()} วัน')
 print()
 print('รายละเอียด Anomaly:')
-print(anomaly_df[['total_passengers', 'z_score', 'anomaly_type', 'day_of_week']].to_string())
+print(anomaly_df[['total_passengers', 'z_score', 'anomaly_type', 'day_of_week', 'is_weekend']].to_string())
 
 # %% [markdown]
 # ### 6.3 Anomaly Visualization — Ridership Trend พร้อม Highlight จุด Anomaly
@@ -1294,13 +1315,39 @@ fig.update_layout(
     yaxis_title='ผู้โดยสาร (คน)',
     hovermode='x unified',
 )
+
+# Annotate ชื่อเหตุการณ์ที่รู้จักบนกราฟ — กรรมการเห็น context ทันที
+_known_events = {
+    pd.Timestamp('2025-04-13'): 'สงกรานต์',
+    pd.Timestamp('2025-04-14'): 'สงกรานต์',
+    pd.Timestamp('2025-04-15'): 'สงกรานต์',
+    pd.Timestamp('2025-01-01'): 'ปีใหม่',
+    pd.Timestamp('2026-01-01'): 'ปีใหม่',
+    pd.Timestamp('2026-04-13'): 'สงกรานต์',
+}
+for ann_date, ann_text in _known_events.items():
+    if ann_date in pivot_df.index:
+        fig.add_annotation(
+            x=ann_date,
+            y=pivot_df.loc[ann_date, 'total_passengers'],
+            text=ann_text,
+            showarrow=True,
+            arrowhead=2,
+            arrowcolor='darkred',
+            font=dict(size=10, color='darkred'),
+            bgcolor='lightyellow',
+            yshift=10,
+        )
+
 fig.show()
 
 # %% [markdown]
 # ### 6.4 Z-Score Distribution — ตรวจสอบการกระจายตัว
 
 # %%
-# Histogram Z-score — ควรมีรูปร่างใกล้เคียง Normal Distribution
+# Histogram Z-score — time-series ridership มักไม่ Normal อย่างสมบูรณ์
+# เพราะมี seasonality (weekday > weekend), trend, และ holiday effects
+# Z-score ใช้เป็น heuristic anomaly detector ไม่ใช่ parametric test
 # แท่งที่อยู่นอก ±3 คือ anomaly ที่ตรวจพบ
 fig = px.histogram(
     pivot_df,
@@ -1339,6 +1386,10 @@ thai_holidays = pd.DataFrame({
         'asanha_bucha',                       # 2025
         'king_bday',                          # 2025 (28 ก.ค.)
         'mother_day',                         # 2025 (12 ส.ค.)
+        # วันหยุดยาว (Long Weekends) — Fri หรือ Mon ติดกับ weekend
+        'long_weekend', 'long_weekend',       # มาฆบูชา + วันหยุดชดเชย
+        'long_weekend', 'long_weekend',       # วันฉัตรมงคล + ชดเชย
+        'long_weekend',                       # วันเฉลิมพระชนมพรรษา ร.10 ชดเชย
     ],
     'ds': pd.to_datetime([
         '2025-04-13', '2025-04-14', '2025-04-15',
@@ -1353,12 +1404,19 @@ thai_holidays = pd.DataFrame({
         '2025-07-10',
         '2025-07-28',
         '2025-08-12',
+        '2025-02-12', '2025-02-14',   # มาฆบูชา + วันวาเลนไทน์ long weekend
+        '2025-05-02', '2025-05-06',   # ชดเชยฉัตรมงคล
+        '2025-07-29',                 # ชดเชยวันเฉลิมพระชนมพรรษา
     ]),
-    'lower_window': [-1] * 21,   # รวม 1 วันก่อนวันหยุด
-    'upper_window': [ 1] * 21,   # รวม 1 วันหลังวันหยุด
+    # สงกรานต์มีผลกระทบยาวกว่า 1 วัน → ใช้ window ±3 สำหรับสงกรานต์
+    # วันหยุดอื่นใช้ window ±1 เพราะผลกระทบสั้นกว่า
+    # หมายเหตุ: หากต้องการ scale up สามารถใช้ Prophet built-in holidays แทนได้
+    'lower_window': [-3,-3,-3, -3,-3,-3, -1,-1,-1, -1,-1, -1,-1, -1,-1, -1, -1, -1, -1, -1, -1, -1,-1, -1,-1, -1],
+    'upper_window': [ 3, 3, 3,  3, 3, 3,  1, 1, 1,  1, 1,  1, 1,  1, 1,  1,  1,  1,  1,  1,  1,  1, 1,  1, 1,  1],
 })
 
 # สร้าง date range สำหรับแต่ละวันหยุดรวม window
+# ใช้ groupby + agg แทน drop_duplicates เพื่อรวมชื่อเทศกาลที่ซ้อนกัน (เช่น songkran,long_weekend)
 holiday_ranges = []
 for _, row in thai_holidays.iterrows():
     for offset in range(int(row['lower_window']), int(row['upper_window']) + 1):
@@ -1366,7 +1424,14 @@ for _, row in thai_holidays.iterrows():
             'date':    row['ds'] + pd.Timedelta(days=offset),
             'holiday': row['holiday'],
         })
-holiday_range_df = pd.DataFrame(holiday_ranges).drop_duplicates('date').set_index('date')
+
+holiday_range_df = (
+    pd.DataFrame(holiday_ranges)
+    .groupby('date')['holiday']
+    .agg(lambda x: ','.join(sorted(set(x))))
+    .reset_index()
+    .set_index('date')
+)
 
 # เชื่อมข้อมูล anomaly กับวันหยุด
 if len(anomaly_df) > 0:
@@ -1402,7 +1467,9 @@ for event_name, event_dates in impact_events.items():
         continue
 
     event_start = min(valid_dates)
-    # baseline = ค่าเฉลี่ย 14 วันก่อนหน้าช่วงเทศกาล
+    # baseline = ค่าเฉลี่ย 14 วันก่อนหน้า โดย skip 7 วันสุดท้ายก่อนเทศกาล
+    # เพราะในบางเทศกาล ผู้คนเริ่มเดินทางล่วงหน้า 1 สัปดาห์ (pre-holiday effect)
+    # → ใช้ช่วง [event_start - 21d, event_start - 7d] เป็น baseline
     baseline_start = event_start - pd.Timedelta(days=21)
     baseline_end   = event_start - pd.Timedelta(days=7)
     baseline_mask  = (pivot_df.index >= baseline_start) & (pivot_df.index <= baseline_end)
@@ -1492,18 +1559,80 @@ else:
 # %%
 # soft_anomaly: |z| > 2 แต่ ≤ 3
 pivot_df['soft_anomaly'] = (pivot_df['z_score'].abs() > 2) & (~pivot_df['is_anomaly'])
+
+# แยก soft_spike / soft_drop เพื่อวิเคราะห์ต่อได้
+pivot_df['soft_anomaly_type'] = 'normal'
+pivot_df.loc[pivot_df['soft_anomaly'] & (pivot_df['z_score'] > 0), 'soft_anomaly_type'] = 'soft_spike'
+pivot_df.loc[pivot_df['soft_anomaly'] & (pivot_df['z_score'] < 0), 'soft_anomaly_type'] = 'soft_drop'
+
 soft_anomaly_df = pivot_df[pivot_df['soft_anomaly']].copy()
 
 print(f'Soft anomaly (2 < |z| ≤ 3): {len(soft_anomaly_df)} วัน')
+print(f'  → soft_spike: {(pivot_df["soft_anomaly_type"] == "soft_spike").sum()} วัน')
+print(f'  → soft_drop:  {(pivot_df["soft_anomaly_type"] == "soft_drop").sum()} วัน')
 if len(soft_anomaly_df) > 0:
     soft_anomaly_df['day_of_week'] = soft_anomaly_df.index.day_name()
-    print(soft_anomaly_df[['total_passengers', 'z_score', 'day_of_week']].to_string())
+    print(soft_anomaly_df[['total_passengers', 'z_score', 'soft_anomaly_type', 'day_of_week']].to_string())
 
 # %% [markdown]
-# ### 6.9 สรุปข้อค้นพบ Phase 6 (Event Detection Insights)
+# ### 6.9 Unknown Anomaly Investigation — anomaly ที่ไม่ตรงกับวันหยุดที่รู้จัก
+
+# %%
+# ตรวจสอบ anomaly ที่ยังไม่ทราบสาเหตุ → อาจเป็น strikes, concerts, political events
+if len(anomaly_df) > 0 and 'anomaly_mapped' in dir():
+    unknown_anomaly = anomaly_mapped[anomaly_mapped['holiday'] == 'ไม่ทราบเหตุการณ์'].copy()
+    print(f'Unknown anomaly (ไม่อยู่ในปฏิทินวันหยุด): {len(unknown_anomaly)} วัน')
+    if len(unknown_anomaly) > 0:
+        print(unknown_anomaly[['total_passengers', 'z_score', 'anomaly_type', 'day_of_week']].to_string())
+        print('\n💡 สิ่งที่ควรตรวจสอบเพิ่มเติมสำหรับ unknown anomaly:')
+        print('   - การประท้วง/หยุดงาน (transport strike)')
+        print('   - คอนเสิร์ต/งาน event ขนาดใหญ่')
+        print('   - เหตุการณ์ทางการเมือง')
+        print('   - ปัญหาระบบขัดข้อง (service disruption)')
+    else:
+        print('✅ Anomaly ทั้งหมดสามารถอธิบายได้ด้วยปฏิทินวันหยุดที่กำหนด')
+
+# %% [markdown]
+# ### 6.10 Ridership vs Day-of-Week Boxplot — ยืนยันว่า Anomaly ไม่ใช่แค่ Weekend Effect
+
+# %%
+# Boxplot แสดงการกระจายตัวของ total_passengers แต่ละวันในสัปดาห์
+# วัตถุประสงค์: แสดงให้เห็นว่า anomaly เกิดขึ้น "นอกเหนือ" จาก weekend pattern ปกติ
+day_order_full = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+
+boxday_df = pivot_df[['total_passengers', 'anomaly_type']].copy()
+boxday_df['day_of_week'] = boxday_df.index.day_name()
+
+fig = px.box(
+    boxday_df.replace(0, np.nan),
+    x='day_of_week',
+    y='total_passengers',
+    color='day_of_week',
+    category_orders={'day_of_week': day_order_full},
+    title='การกระจายตัวผู้โดยสารแต่ละวันในสัปดาห์ — แสดง Weekend Effect (Ridership by Day of Week)',
+    labels={'total_passengers': 'ผู้โดยสารรวม (คน)', 'day_of_week': 'วัน'},
+)
+
+# overlay จุด anomaly บน boxplot เพื่อแสดงว่า anomaly กระจายทั่วทุกวัน ไม่ใช่แค่ weekend
+if len(anomaly_df) > 0:
+    anomaly_box = anomaly_df[['total_passengers', 'anomaly_type']].copy()
+    anomaly_box['day_of_week'] = anomaly_box.index.day_name()
+    fig.add_trace(go.Scatter(
+        x=anomaly_box['day_of_week'],
+        y=anomaly_box['total_passengers'],
+        mode='markers',
+        name='Anomaly Points',
+        marker=dict(color='red', size=10, symbol='x', line=dict(width=2)),
+    ))
+
+fig.show()
+
+# %% [markdown]
+# ### 6.12 สรุปข้อค้นพบ Phase 6 (Event Detection Insights)
 
 # %%
 # สรุปเชิงปริมาณ — ส่งต่อใน Phase 9 (Insights & Conclusion)
+# anomaly_rate < 0.5% = threshold อาจเข้มงวดเกินไป, > 5% = อาจหย่อนเกินไป
 n_anomaly       = len(anomaly_df)
 n_spike         = (pivot_df['anomaly_type'] == 'spike').sum()
 n_drop          = (pivot_df['anomaly_type'] == 'drop').sum()
@@ -1516,8 +1645,29 @@ print(f'Anomaly (|z| > 3):           {n_anomaly} วัน ({pct_anomaly:.1f}%)'
 print(f'  → Spike:                   {n_spike} วัน')
 print(f'  → Drop:                    {n_drop} วัน')
 print(f'Soft anomaly (2 < |z| ≤ 3):  {n_soft} วัน')
+if pct_anomaly < 0.5:
+    print(f'⚠️  anomaly_rate {pct_anomaly:.2f}% < 0.5% → threshold อาจเข้มงวดเกินไป ลองลด |z| > 2.5')
+elif pct_anomaly > 5:
+    print(f'⚠️  anomaly_rate {pct_anomaly:.2f}% > 5% → threshold อาจหย่อนเกินไป ลองเพิ่ม |z| > 3.5')
 
 if impact_results:
     print('\n=== Holiday Impact ===')
     for r in impact_results:
         print(f'  {r["เทศกาล"]}: {r["impact_pct"]:+.1f}% ({r["ผลกระทบ"]})')
+
+# Holiday value_counts — แสดงว่า anomaly มักเกิดจากเทศกาลอะไร
+if len(anomaly_df) > 0 and 'anomaly_mapped' in dir():
+    print('\n=== Anomaly ↔ Holiday Frequency ===')
+    print(anomaly_mapped['holiday'].value_counts().to_string())
+    top_holiday = anomaly_mapped['holiday'].value_counts().idxmax()
+    top_holiday_count = anomaly_mapped['holiday'].value_counts().max()
+    print(f'\n📊 Insight: anomaly ส่วนใหญ่เกิดจาก "{top_holiday}" ({top_holiday_count} วัน)')
+    print('   ยืนยันว่าวันหยุดแห่งชาติ (โดยเฉพาะสงกรานต์และปีใหม่)')
+    print('   มีผลกระทบอย่างมีนัยสำคัญต่อปริมาณผู้โดยสารระบบรถไฟฟ้าในเมือง')
+
+# Weekday vs Weekend Anomaly Breakdown
+if len(anomaly_df) > 0:
+    print('\n=== Weekday vs Weekend Anomaly ===')
+    wd_we_anomaly = anomaly_df.groupby('is_weekend')['anomaly_type'].value_counts().unstack(fill_value=0)
+    wd_we_anomaly.index = wd_we_anomaly.index.map({False: 'Weekday', True: 'Weekend'})
+    print(wd_we_anomaly.to_string())
