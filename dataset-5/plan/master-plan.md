@@ -382,7 +382,13 @@ Passenger stability metric: **standard deviation**
 Reveal commuter behavior patterns by day of week:
 
 ```python
-rail_lines = ["BTS", "MRT Blue", "MRT Purple", "ARL", "SRT Red"]
+# Single authoritative list — used consistently across Phase 5, 6, 7
+rail_lines = [
+    "BTS",
+    "MRT Blue", "MRT Purple", "MRT Yellow", "MRT Pink",
+    "Airport Rail Link",
+    "SRT Red"
+]
 
 weekday_avg = (
     pivot_df[rail_lines]
@@ -451,6 +457,66 @@ fig.show()
 Interpretation:
 - **High correlation (> 0.8)** → lines share the same demand drivers (e.g., economic activity, holidays)
 - **Low correlation (< 0.3)** → lines serve different commuter segments
+
+---
+
+## Lag Correlation (Transfer Behaviour)
+
+A regular contemporaneous correlation doesn’t reveal *directionality*. A lag-1 correlation shows whether ridership on one line **leads** another by a day — a signal of commuter transfer behaviour:
+
+```python
+import pandas as pd
+
+lag_pairs = [
+    ("BTS",         "MRT Blue"),
+    ("BTS",         "MRT Purple"),
+    ("Airport Rail Link", "BTS"),
+    ("MRT Blue",    "Airport Rail Link"),
+]
+
+lag_results = []
+for line_a, line_b in lag_pairs:
+    lag0 = pivot_df[line_a].corr(pivot_df[line_b])
+    lag1 = pivot_df[line_a].corr(pivot_df[line_b].shift(1))
+    lag_results.append({"Pair": f"{line_a} → {line_b}", "Lag-0": round(lag0, 3), "Lag-1": round(lag1, 3)})
+
+lag_df = pd.DataFrame(lag_results)
+print(lag_df)
+```
+
+Interpretation:
+- **Lag-1 > Lag-0** → ridership on line B *follows* line A by one day → possible transfer or spillover effect
+- **Lag-1 ≈ Lag-0** → simultaneous demand drivers (shared holidays, events)
+
+---
+
+## Ridership Market Share Over Time
+
+Rather than a static pie chart, this **stacked area chart** shows how each line’s market share *evolves* across the 14-month period:
+
+```python
+import plotly.express as px
+
+share_df = pivot_df[rail_lines].div(
+    pivot_df[rail_lines].sum(axis=1), axis=0
+).multiply(100)  # convert to percentage
+
+fig = px.area(
+    share_df.reset_index().melt(id_vars="date", var_name="Line", value_name="Share (%)"),
+    x="date",
+    y="Share (%)",
+    color="Line",
+    title="Rail Line Market Share Over Time (%)",
+    labels={"date": "Date"}
+)
+fig.update_layout(yaxis_range=[0, 100])
+fig.show()
+```
+
+What this reveals:
+- Lines gaining share → growing faster than the network
+- Lines losing share → losing relative demand
+- Sudden share shifts → may coincide with new line openings or service disruptions
 
 ---
 
@@ -643,13 +709,18 @@ Prophet expects a dataset with two columns:
 ```python
 prophet_df = pivot_df.reset_index()[["date", "total_passengers"]]
 prophet_df.columns = ["ds", "y"]
+
+# ⚠️  Build regressor columns on prophet_df FIRST,
+#     then split into train/test so both subsets carry the columns.
+prophet_df["is_weekend"] = prophet_df["ds"].dt.weekday >= 5
+prophet_df["month"]      = prophet_df["ds"].dt.month
 ```
 
 ---
 
 ## Train / Test Split
 
-Split the last 30 days as a hold-out test set for evaluation:
+Split AFTER adding regressors so both subsets contain the extra columns:
 
 ```python
 train = prophet_df[:-30]
@@ -689,6 +760,10 @@ holidays = pd.DataFrame({
     ]),
     "lower_window": [-1]*15,
     "upper_window": [ 1]*15,
+    # prior_scale controls how strongly holiday effects pull the forecast
+    # Higher value (10-20) = stronger holiday dip/spike modelled
+    # Default is 10; lower it if the holiday effect is overfitting
+    "prior_scale": [10.0]*15,
 })
 
 model = Prophet(
@@ -744,14 +819,12 @@ Prophet will automatically show:
 
 ## Extra Regressors
 
-Improve forecast accuracy by adding known external features as regressors. Prophet treats these as additional linear terms alongside the decomposition:
+Improve forecast accuracy by adding known external features as regressors. Prophet treats these as additional linear terms alongside the decomposition.
+
+Regressor columns are **already present** on `train` and `test` from the Prepare step above:
 
 ```python
-# Prepare regressor columns on the prophet_df
-prophet_df["is_weekend"] = prophet_df["ds"].dt.weekday >= 5
-prophet_df["month"] = prophet_df["ds"].dt.month
-
-# Then declare them in the model BEFORE fitting
+# Declare regressors in the model BEFORE fitting
 model = Prophet(
     yearly_seasonality=True,
     weekly_seasonality=True,
@@ -763,12 +836,12 @@ model = Prophet(
 model.add_regressor("is_weekend")
 model.add_regressor("month")
 
-model.fit(train)  # train must also contain these columns
+model.fit(train)   # train already has is_weekend + month columns ✅
 
-# Future dataframe must include regressor values too
+# Carry regressor values into the future dataframe
 future = model.make_future_dataframe(periods=30)
 future["is_weekend"] = future["ds"].dt.weekday >= 5
-future["month"] = future["ds"].dt.month
+future["month"]      = future["ds"].dt.month
 
 forecast = model.predict(future)
 ```
@@ -1047,22 +1120,24 @@ Final notebook structure:
 1. Modal Share Pie Chart
 2. Modal Share Stacked Area
 3. YoY Growth Bar Chart
-4. Ridership Trend (Multi-line)
-5. Rail Line Comparison
-6. Rolling Trend Chart
-7. Calendar Heatmap (daily ridership grid)
-8. Anomaly Detection Plot (with highlighted anomaly points)
-9. Weekday Ridership Bar Chart
-10. Rolling 30-Day YoY Growth Line Chart
-11. Ridership Correlation Heatmap
-12. Ridership Distribution Box Plot
-13. Forecast Plot (total + per line)
-14. Forecast vs Actual Evaluation Plot
-15. Cross-Validation MAPE vs Horizon Plot
-16. Prophet Components Plot (trend + seasonality)
-17. Residual Distribution + Residual Over Time
+4. Ridership Market Share Over Time (stacked area)
+5. Ridership Trend (Multi-line)
+6. Rail Line Comparison
+7. Rolling Trend Chart
+8. Calendar Heatmap (daily ridership grid)
+9. Anomaly Detection Plot (with highlighted anomaly points)
+10. Weekday Ridership Bar Chart
+11. Rolling 30-Day YoY Growth Line Chart
+12. Ridership Correlation Heatmap
+13. Lag Correlation Table (transfer behaviour)
+14. Ridership Distribution Box Plot
+15. Forecast Plot (total + per line)
+16. Forecast vs Actual Evaluation Plot
+17. Cross-Validation MAPE vs Horizon Plot
+18. Prophet Components Plot (trend + seasonality)
+19. Residual Distribution + Residual Over Time
 
-**Total:** 16–18 visualizations
+**Total:** 18–20 visualizations
 
 ---
 
