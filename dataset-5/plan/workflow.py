@@ -1604,6 +1604,7 @@ boxday_df = pivot_df[['total_passengers', 'anomaly_type']].copy()
 boxday_df['day_of_week'] = boxday_df.index.day_name()
 
 fig = px.box(
+    data_frame=boxday_df,
     x='day_of_week',
     y='total_passengers',
     color='day_of_week',
@@ -1869,8 +1870,10 @@ fig.add_trace(go.Scatter(
     line=dict(color='tomato', width=2.5),
 ))
 
-fig.add_vline(x=_train_end, line_dash='dash', line_color='gray',
-              annotation_text='Train | Forecast', annotation_position='top right')
+fig.add_vline(x=str(_train_end.date()), line_dash='dash', line_color='gray')
+fig.add_annotation(x=str(_train_end.date()), y=1, xref='x', yref='paper',
+                   text='Train | Forecast', showarrow=False, xanchor='left',
+                   bgcolor='white', bordercolor='gray', borderwidth=1)
 fig.update_layout(
     title='การพยากรณ์ผู้โดยสาร 30 วัน ด้วย Prophet — 80% CI',
     xaxis_title='วันที่', yaxis_title='ผู้โดยสาร (คน)',
@@ -1982,8 +1985,11 @@ for i, line in enumerate(forecast_lines):
         legendgroup=line,
     ))
 
-fig.add_vline(x=train['ds'].max(), line_dash='dash', line_color='gray',
-              annotation_text='Forecast start')
+_fc_start_str = str(train['ds'].max().date())
+fig.add_vline(x=_fc_start_str, line_dash='dash', line_color='gray')
+fig.add_annotation(x=_fc_start_str, y=1, xref='x', yref='paper',
+                   text='Forecast start', showarrow=False, xanchor='left',
+                   bgcolor='white', bordercolor='gray', borderwidth=1)
 fig.update_layout(
     title='การพยากรณ์ผู้โดยสารแยกตามสายรถไฟฟ้า (Per-Line Forecast)',
     xaxis_title='วันที่', yaxis_title='ผู้โดยสาร (คน)',
@@ -2018,3 +2024,356 @@ for line in forecast_lines:
     act90  = _lfc['train']['y'].tail(90).mean()
     chg    = (fc_avg - act90) / act90 * 100 if act90 > 0 else float('nan')
     print(f'  {line:<22}: forecast {fc_avg:>10,.0f}  vs actual {act90:>10,.0f}  ({chg:+.1f}%)')
+
+# %% [markdown]
+# ---
+# ## Phase 8 — ประเมินผลโมเดล (Model Evaluation)
+#
+# **Metrics ที่ใช้:**
+# | Metric  | สูตร                            | ความหมาย                     |
+# |---------|---------------------------------|------------------------------|
+# | MAE     | mean\|y − ŷ\|                    | ค่าเฉลี่ยความผิดพลาดสัมบูรณ์  |
+# | RMSE    | √mean(y − ŷ)²                   | ลงโทษ error ใหญ่หนักกว่า      |
+# | MAPE    | mean\|y−ŷ\|/y × 100             | % error                      |
+# | sMAPE   | mean 2\|y−ŷ\|/(|y|+|ŷ|) × 100  | MAPE ทนทาน y≈0               |
+#
+# การวิเคราะห์: eval_df → metrics → baseline → viz → error scatter →
+# PI coverage → directional accuracy → cross-validation → horizon plot →
+# residual diagnostics → per-line eval → summary
+
+# %% [markdown]
+# ### 8.1 สร้าง eval_df
+
+# %%
+eval_df = test.merge(
+    forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']],
+    on='ds', how='inner',
+)
+
+# plot_df: ทุกวัน สำหรับกราฟ + coverage + directional accuracy
+# eval_df_clean: ลบ y=0/NaN สำหรับ MAPE/metrics (ป้องกัน ÷0)
+plot_df       = eval_df.copy()
+eval_df_clean = eval_df[(eval_df['y'] > 0) & eval_df['y'].notna()].copy()
+
+print(f'eval_df: {len(eval_df)} วัน  (clean: {len(eval_df_clean)} วัน)')
+print(eval_df_clean[['ds','y','yhat','yhat_lower','yhat_upper']].to_string(index=False))
+
+# %% [markdown]
+# ### 8.2 MAE / RMSE / MAPE / sMAPE
+
+# %%
+y_true = eval_df_clean['y'].values
+y_pred = eval_df_clean['yhat'].values
+
+mae   = mean_absolute_error(y_true, y_pred)
+rmse  = np.sqrt(mean_squared_error(y_true, y_pred))
+mape  = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+smape = np.mean(2 * np.abs(y_true - y_pred) / (np.abs(y_true) + np.abs(y_pred))) * 100
+
+print('=== Model Metrics (Total — 30-Day Test) ===')
+print(f'MAE:   {mae:>12,.0f} คน')
+print(f'RMSE:  {rmse:>12,.0f} คน')
+print(f'MAPE:  {mape:>11.2f}%')
+print(f'sMAPE: {smape:>11.2f}%')
+
+# %% [markdown]
+# ### 8.3 Naive & Seasonal Naive Baseline
+#
+# ใช้ DataFrame merge เพื่อป้องกัน misalignment กรณีมี missing dates
+
+# %%
+# Naive (shift-1)
+naive_df = eval_df_clean[['ds','y']].copy()
+naive_df['naive'] = naive_df['y'].shift(1)
+naive_df = naive_df.dropna()
+
+nai_mae  = mean_absolute_error(naive_df['y'], naive_df['naive'])
+nai_rmse = np.sqrt(mean_squared_error(naive_df['y'], naive_df['naive']))
+nai_mape = np.mean(np.abs((naive_df['y'] - naive_df['naive']) / naive_df['y'])) * 100
+
+# Seasonal Naive (shift-7)
+sn_df = eval_df_clean[['ds','y']].copy()
+sn_df['sn'] = sn_df['y'].shift(7)
+sn_df = sn_df.dropna()
+
+if len(sn_df) >= 3:
+    sn_mae  = mean_absolute_error(sn_df['y'], sn_df['sn'])
+    sn_rmse = np.sqrt(mean_squared_error(sn_df['y'], sn_df['sn']))
+    sn_mape = np.mean(np.abs((sn_df['y'] - sn_df['sn']) / sn_df['y'])) * 100
+else:
+    sn_mae = sn_rmse = sn_mape = float('nan')
+
+comparison_df = pd.DataFrame({
+    'โมเดล': ['Naive (t-1)', 'Seasonal Naive (t-7)', 'Prophet'],
+    'MAE':   [round(nai_mae), round(sn_mae) if not np.isnan(sn_mae) else None, round(mae)],
+    'RMSE':  [round(nai_rmse), round(sn_rmse) if not np.isnan(sn_rmse) else None, round(rmse)],
+    'MAPE':  [round(nai_mape,2), round(sn_mape,2) if not np.isnan(sn_mape) else None, round(mape,2)],
+    'sMAPE': [None, None, round(smape,2)],
+})
+
+print('=== Baseline Comparison ===')
+print(comparison_df.to_string(index=False))
+
+if mae < nai_mae:
+    print(f'\n✅ Prophet ชนะ Naive: MAE ลดลง {(nai_mae - mae) / nai_mae * 100:.1f}%')
+else:
+    print('\n⚠️ Prophet แพ้ Naive — ลองปรับ changepoint_prior_scale')
+
+# %% [markdown]
+# ### 8.4 Forecast vs Actual Visualization (80% CI)
+
+# %%
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=plot_df['ds'], y=plot_df['y'],
+                         name='Actual', line=dict(color='steelblue', width=2)))
+fig.add_trace(go.Scatter(x=plot_df['ds'], y=plot_df['yhat'],
+                         name='Forecast', line=dict(color='tomato', width=2, dash='dash')))
+fig.add_trace(go.Scatter(
+    x=pd.concat([plot_df['ds'], plot_df['ds'][::-1]]),
+    y=pd.concat([plot_df['yhat_upper'], plot_df['yhat_lower'][::-1]]),
+    fill='toself', fillcolor='rgba(255,100,100,0.15)',
+    line=dict(color='rgba(0,0,0,0)'), name='80% CI',
+))
+fig.add_annotation(
+    x=plot_df['ds'].iloc[0], y=plot_df['y'].max(),
+    text=f'MAPE={mape:.2f}%  MAE={mae:,.0f}',
+    showarrow=False, font=dict(size=12, color='darkred'),
+    bgcolor='lightyellow', xanchor='left',
+)
+fig.update_layout(title='Prophet Forecast vs Actual — 30-Day Test (80% CI)',
+                  xaxis_title='วันที่', yaxis_title='ผู้โดยสาร (คน)',
+                  hovermode='x unified')
+fig.show()
+
+# %% [markdown]
+# ### 8.5 Forecast Error vs Actual Scatter — ตรวจ Heteroskedasticity & Bias
+#
+# ใช้ pct_error เป็น color เพื่อแยก under/over forecast ได้ชัดกว่า residual สัมบูรณ์
+# Trend line (OLS): ถ้า slope ≠ 0 → bias เพิ่มตาม scale (heteroskedasticity)
+
+# %%
+eval_df_clean['residual']  = eval_df_clean['y'] - eval_df_clean['yhat']
+eval_df_clean['pct_error'] = eval_df_clean['residual'] / eval_df_clean['y'] * 100
+
+fig = px.scatter(
+    eval_df_clean, x='y', y='residual',
+    color='pct_error',                     # สี = % error (ชัดกว่า absolute residual)
+    color_continuous_scale='RdBu', color_continuous_midpoint=0,
+    title='Forecast Error vs Actual — ตรวจ Bias & Heteroskedasticity',
+    labels={'y': 'Actual (คน)', 'residual': 'Residual (Actual−Forecast)', 'pct_error': '% Error'},
+)
+fig.add_hline(y=0, line_dash='dash', line_color='gray', annotation_text='Zero (no bias)')
+
+if len(eval_df_clean) > 3:
+    _coef    = np.polyfit(eval_df_clean['y'].values, eval_df_clean['residual'].values, 1)
+    _x_range = np.linspace(eval_df_clean['y'].min(), eval_df_clean['y'].max(), 50)
+    fig.add_trace(go.Scatter(
+        x=_x_range, y=np.polyval(_coef, _x_range),
+        name='Trend (OLS)', line=dict(color='orange', dash='dash', width=2),
+    ))
+fig.show()
+
+# %% [markdown]
+# ### 8.6 Prediction Interval Coverage — CI Calibration (80% CI ควร ~80%)
+
+# %%
+# ใช้ plot_df ทุกวัน (รวม y=0) — coverage ควรสะท้อน all observations
+coverage = (
+    (plot_df['y'] >= plot_df['yhat_lower']) &
+    (plot_df['y'] <= plot_df['yhat_upper'])
+).mean() * 100
+
+print(f'PI Coverage (80% CI): {coverage:.1f}%')
+if 70 <= coverage <= 90:
+    print('✅ CI calibrated ดี (70–90%)')
+elif coverage > 90:
+    print('⚠️ CI กว้างเกินไป — ลอง interval_width=0.7')
+else:
+    print('⚠️ CI แคบเกินไป — ลอง interval_width=0.9')
+
+# %% [markdown]
+# ### 8.7 Directional Accuracy
+#
+# ใช้ plot_df (ทุกวัน) ไม่ใช่ eval_df_clean — การลบ y=0 ทำให้ sequence ขาด
+
+# %%
+y_true_dir = plot_df['y'].values
+y_pred_dir = plot_df['yhat'].values
+
+if len(y_true_dir) > 1:
+    dir_acc = np.mean(np.sign(np.diff(y_true_dir)) == np.sign(np.diff(y_pred_dir))) * 100
+    print(f'Directional Accuracy: {dir_acc:.1f}%')
+    print('✅ ดีกว่าสุ่มเดา (50%)' if dir_acc >= 60 else '⚠️ ไม่ดีกว่า random guess')
+else:
+    dir_acc = float('nan')
+    print('⚠️ ข้อมูลน้อยเกินไป')
+
+# %% [markdown]
+# ### 8.8 Prophet Cross-Validation — Rolling Window
+
+# %%
+_initial_days = min(
+    max(int(len(train) * 0.6), 180),
+    len(train) - 60,   # เผื่อ horizon+buffer ภายใน training
+)
+
+try:
+    cv_results = cross_validation(
+        model,
+        initial=f'{_initial_days} days',
+        period='30 days',
+        horizon='30 days',
+        parallel='processes',
+    )
+    cv_metrics = performance_metrics(cv_results)
+    cv_metrics['mape_pct'] = cv_metrics['mape'] * 100   # ratio → percent
+
+    print('=== Cross-Validation Metrics ===')
+    print(cv_metrics[['horizon','mae','rmse','mape_pct']].tail(10).to_string(index=False))
+
+except Exception as e:
+    print(f'⚠️ Cross-validation ล้มเหลว: {e}')
+    cv_results = None
+    cv_metrics = None
+
+# %% [markdown]
+# ### 8.9 MAPE & RMSE vs Horizon Plot
+
+# %%
+if cv_metrics is not None:
+    from prophet.plot import plot_cross_validation_metric
+    fig_cv = plot_cross_validation_metric(cv_results, metric='mape')
+    fig_cv.suptitle('MAPE vs Forecast Horizon (Cross-Validation)', y=1.02)
+    fig_cv.tight_layout()
+
+    cv_plot = cv_metrics.copy()
+    cv_plot['horizon_days'] = cv_plot['horizon'].dt.days
+
+    # MAPE vs Horizon
+    fig = px.line(cv_plot, x='horizon_days', y='mape_pct', markers=True,
+                  title='MAPE vs Horizon (Cross-Validation)',
+                  labels={'horizon_days': 'Horizon (วัน)', 'mape_pct': 'MAPE (%)'})
+    fig.add_hline(y=mape, line_dash='dash', line_color='tomato',
+                  annotation_text=f'Single test={mape:.2f}%')
+    fig.show()
+
+    # RMSE vs Horizon (เพิ่มเติม)
+    fig2 = px.line(cv_plot, x='horizon_days', y='rmse', markers=True,
+                   title='RMSE vs Horizon (Cross-Validation)',
+                   labels={'horizon_days': 'Horizon (วัน)', 'rmse': 'RMSE (คน)'})
+    fig2.add_hline(y=rmse, line_dash='dash', line_color='tomato',
+                   annotation_text=f'Single test={rmse:,.0f}')
+    fig2.show()
+
+# %% [markdown]
+# ### 8.10 Residual Analysis + Autocorrelation
+
+# %%
+fig1 = px.scatter(
+    eval_df_clean, x='ds', y='residual', color='pct_error',
+    color_continuous_scale='RdBu', color_continuous_midpoint=0,
+    title='Residuals Over Time',
+    labels={'residual': 'Residual (คน)', 'ds': 'วันที่', 'pct_error': '% Error'},
+)
+fig1.add_hline(y=0, line_dash='dash', line_color='gray')
+fig1.show()
+
+fig2 = px.histogram(eval_df_clean, x='residual', nbins=20,
+                    title='Residual Distribution',
+                    color_discrete_sequence=['steelblue'])
+fig2.add_vline(x=0, line_dash='dash', line_color='red', annotation_text='Zero')
+fig2.add_vline(x=eval_df_clean['residual'].mean(), line_dash='dot', line_color='orange',
+               annotation_text=f'Mean={eval_df_clean["residual"].mean():,.0f}')
+fig2.show()
+
+# %%
+# Autocorrelation — guard: ตรวจ len > lag ก่อนคำนวณ เพื่อป้องกัน NaN crash
+lag_corrs = [
+    eval_df_clean['residual'].autocorr(lag=k) if len(eval_df_clean) > k else np.nan
+    for k in range(1, 8)
+]
+lag_df = pd.DataFrame({'Lag (วัน)': range(1, 8), 'Autocorrelation': lag_corrs})
+print('=== Residual Autocorrelation ===')
+print(lag_df.to_string(index=False))
+
+valid_lags = lag_df.dropna()
+if len(valid_lags) > 0:
+    max_lag = valid_lags.loc[valid_lags['Autocorrelation'].abs().idxmax()]
+    if abs(max_lag['Autocorrelation']) > 0.4:
+        print(f'\n⚠️ Autocorr สูงที่ lag {int(max_lag["Lag (วัน)"])} ({max_lag["Autocorrelation"]:.3f})')
+        print('   → ลองเพิ่ม seasonality หรือ regressors')
+    else:
+        print('\n✅ Residuals ไม่มี autocorrelation มีนัยสำคัญ')
+
+# %% [markdown]
+# ### 8.11 Per-Line Model Evaluation
+
+# %%
+per_line_metrics = []
+
+for line in forecast_lines:
+    _lfc   = line_forecasts[line]
+    l_eval = _lfc['test'].merge(
+        _lfc['forecast'][['ds','yhat','yhat_lower','yhat_upper']],
+        on='ds', how='inner',
+    )
+    l_clean = l_eval[(l_eval['y'] > 0) & l_eval['y'].notna()].copy()
+
+    if len(l_clean) < 5:
+        continue
+
+    yt, yp = l_clean['y'].values, l_clean['yhat'].values
+    l_mae  = mean_absolute_error(yt, yp)
+    l_rmse = np.sqrt(mean_squared_error(yt, yp))
+    l_mape = np.mean(np.abs((yt - yp) / yt)) * 100
+
+    # PI Coverage — ใช้ l_clean เพื่อหลีกเลี่ยง y=0 ทำให้ coverage สูงเทียม
+    l_cov = (
+        (l_clean['y'] >= l_clean['yhat_lower']) &
+        (l_clean['y'] <= l_clean['yhat_upper'])
+    ).mean() * 100
+
+    # Naive baseline per line
+    n_df = l_clean[['ds','y']].copy()
+    n_df['naive'] = n_df['y'].shift(1)
+    n_df = n_df.dropna()
+    beat = '✅' if (len(n_df) > 0 and l_mae < mean_absolute_error(n_df['y'], n_df['naive'])) else '⚠️'
+
+    per_line_metrics.append({'สาย': line, 'MAE': round(l_mae), 'RMSE': round(l_rmse),
+                             'MAPE': round(l_mape,2), 'PI Cov%': round(l_cov,1),
+                             'vs Naive': beat})
+
+# guard: sort เฉพาะเมื่อมีข้อมูล
+per_line_df = pd.DataFrame(per_line_metrics)
+if len(per_line_df) > 0:
+    per_line_df = per_line_df.sort_values('MAPE').reset_index(drop=True)
+    print('=== Per-Line Evaluation ===')
+    print(per_line_df.to_string(index=False))
+
+    fig = px.bar(per_line_df, x='สาย', y='MAPE', color='MAPE',
+                 color_continuous_scale='RdYlGn_r',
+                 title='MAPE แต่ละสายรถไฟฟ้า', text='MAPE')
+    fig.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+    fig.show()
+
+# %% [markdown]
+# ### 8.12 สรุปผลการประเมินโมเดล Phase 8
+
+# %%
+print('=== Model Evaluation Summary ===')
+print(f'MAE={mae:,.0f}  RMSE={rmse:,.0f}  MAPE={mape:.2f}%  sMAPE={smape:.2f}%')
+print(f'PI Coverage: {coverage:.1f}%  |  Directional Accuracy: {dir_acc:.1f}%')
+print()
+print(comparison_df.to_string(index=False))
+
+if len(per_line_df) > 0:
+    print(f'\nPer-Line: แม่นที่สุด = {per_line_df.iloc[0]["สาย"]} (MAPE {per_line_df.iloc[0]["MAPE"]:.1f}%)')
+    print(f'Per-Line: ยากที่สุด  = {per_line_df.iloc[-1]["สาย"]} (MAPE {per_line_df.iloc[-1]["MAPE"]:.1f}%)')
+
+if cv_metrics is not None:
+    print(f'\nCV avg MAPE: {cv_metrics["mape_pct"].mean():.2f}%')
+
+mean_res = eval_df_clean['residual'].mean()
+bias_pct = abs(mean_res) / eval_df_clean['y'].mean() * 100
+grade    = '✅ Excellent' if bias_pct < 1 else ('🟡 Acceptable' if bias_pct < 3 else '⚠️ Biased')
+print(f'\nBias: {mean_res:,.0f} คน ({bias_pct:.2f}%) [{grade}]')
