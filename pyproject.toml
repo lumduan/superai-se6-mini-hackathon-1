@@ -1,0 +1,12 @@
+[project]
+name = "superai-se6-mini-hackathon-1"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ipykernel>=7.2.0",
+    "plotly>=6.6.0",
+    "prophet>=1.3.0",
+    "scikit-learn>=1.8.0",
+]
